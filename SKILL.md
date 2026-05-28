@@ -84,14 +84,17 @@ A persistent, named AI test team that lives with each project from day one. The 
 ### Verify a diff
 
 ```bash
-# Verify staged changes or a commit SHA
+# REQUIRED: real LLM team — set your Anthropic API key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Verify a commit SHA or staged diff
 python3 ~/.claude/skills/egv-verify/lib/run-egv.py <commit-sha-or-HEAD> --project-root /path/to/project
 
-# Enable Layer 2 (LLM-driven test synthesis for uncovered lines)
-ANTHROPIC_API_KEY=sk-ant-... python3 ~/.claude/skills/egv-verify/lib/run-egv.py <sha> --project-root /path/to/project --enable-layer2
+# Optional: enable Layer 2 (LLM-driven test synthesis for uncovered lines)
+python3 ~/.claude/skills/egv-verify/lib/run-egv.py <sha> --project-root /path/to/project --enable-layer2
 ```
 
-Output: a 6-line verdict summary and a verdict.md report in `reports/<run_id>/`.
+Output: a phase-1/phase-2/QA-Lead verdict summary and a verdict.md report in `reports/<run_id>/` containing the full team conversation.
 
 ### Lifecycle commands
 
@@ -127,11 +130,42 @@ python3 ~/.claude/skills/egv-verify/lib/egv_cli.py layer2-review \
 
 ## Prerequisites
 
+EGV v3 is a REAL LLM agent team — every run, all 8 agents use Claude to reason about your code. This is mandatory, not optional:
+
+- **`ANTHROPIC_API_KEY`** environment variable (get one at https://console.anthropic.com/)
 - Python 3.10+
 - A test framework that emits Istanbul-format coverage JSON (Vitest, Jest, etc.)
-- A `tsc` available for Contract Sentinel (optional — skip if not a TypeScript project)
+- `tsc` for Contract Sentinel (optional — skip if not TypeScript)
 - `tsx` (for running the TypeScript blast-radius computer) — auto-installed via npx
-- Optional: `anthropic` SDK + `ANTHROPIC_API_KEY` for Layer 2 LLM completion
+
+NO Python SDK install required — EGV uses raw HTTPS to the Anthropic API, so it works even when `pip install anthropic` is blocked by PEP 668.
+
+## Cost
+
+Each verification run makes ~13 Claude API calls (6 phase-1 + 6 phase-2 + 1 QA Lead synthesis). With Haiku for most agents and Sonnet for the two "thinking" roles (Auditor + QA Lead), expect **~$0.05-0.20 per run**.
+
+## How the team collaborates each run
+
+EGV v3 runs every verification as a three-phase team process:
+
+### Phase 1: Independent investigation
+Each of 6 specialist agents (Auditor, Sentinel, Contract Sentinel, Performance Watch, Security Scout, A11y Auditor) does their work independently:
+1. Their sensor (regex, coverage, typecheck, tests) gathers deterministic data
+2. They consult their accumulated identity (recent findings, tenure on this project)
+3. They call Claude with their role-specific prompt + sensor data + identity history
+4. They produce a structured finding: verdict, narrative, recommendations
+
+### Phase 2: Team review
+Each agent now sees ALL the team's phase-1 findings. They get a chance to:
+- STAND BY their phase-1 verdict if it still holds
+- ESCALATE if another agent's finding makes them upgrade concern
+- DE-ESCALATE if another agent's finding reframes their own as a false positive
+- Raise CROSS-CUTTING concerns no single agent flagged
+
+### Phase 3: QA Lead synthesis
+The QA Lead reads both phases for every agent. The final verdict and the team summary come from QA Lead's reasoning over the dialogue, not a switch statement.
+
+This is what "real agent team" means here: every run, the team thinks together. Not 6 functions producing 6 reports — 6 specialists arguing toward a verdict, with the QA Lead synthesizing.
 
 ## Multi-user workflow
 

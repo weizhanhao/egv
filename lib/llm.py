@@ -1,53 +1,72 @@
-"""llm.py — Shared LLM infrastructure for EGV agents.
+"""llm.py — Real LLM agent infrastructure for EGV team (v3).
 
-Each agent uses LLMAgent.think() to produce verdict + narrative + recommendations
-on top of their deterministic data. Graceful fallback when ANTHROPIC_API_KEY
-or anthropic SDK is unavailable.
+CRITICAL design decisions:
+1. LLM is MANDATORY for verification runs. No graceful fallback. Missing API key = clear error.
+2. No anthropic SDK required — uses raw urllib HTTPS POST to bypass PEP 668.
+3. Each agent is invoked TWICE per run: once independently (phase 1) and once
+   for team review (phase 2). This is the real team collaboration.
+4. Identity persists across runs via Model Keeper; agent has tenure + accumulated
+   memory. NOT a subagent — no ephemeral spawn.
 
-Model selection:
-- claude-haiku-4-5-20251001 for cheap/fast agents (Security, A11y, Perf)
-- claude-sonnet-4-6 for nuanced reasoning (QA Lead, Cartographer, Auditor narrative)
-
-Cost budget: ~8 LLM calls per full EGV run, capped at 1500 tokens output each.
-At Haiku pricing that's ~$0.01-0.05 per verification run.
+For lifecycle commands (brainstorm/requirements/design-review/reflection), a thin
+backward-compatible ``LLMAgent.think()`` wrapper is provided that gracefully falls
+back when no API key is configured — those commands are advisory, not verification.
 """
+
+from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Optional
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional
 
 
 HAIKU = "claude-haiku-4-5-20251001"
 SONNET = "claude-sonnet-4-6"
+API_URL = "https://api.anthropic.com/v1/messages"
+API_VERSION = "2023-06-01"
+
+
+class LLMUnavailableError(Exception):
+    """Raised when ANTHROPIC_API_KEY is missing. EGV v3 verification requires LLM."""
+
+
+def require_api_key() -> str:
+    """Return the configured API key or raise LLMUnavailableError."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise LLMUnavailableError(
+            "ANTHROPIC_API_KEY environment variable is required.\n"
+            "EGV v3 is a real LLM agent team — every agent uses Claude to reason.\n"
+            "Get your key at https://console.anthropic.com/ and export it:\n"
+            "  export ANTHROPIC_API_KEY=sk-ant-..."
+        )
+    return key
 
 
 def llm_available() -> bool:
-    """Check if LLM calls are possible — API key set AND SDK importable."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return False
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        return False
-    return True
+    """Lightweight check used by lifecycle commands (brainstorm/etc.)."""
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
 @dataclass
 class LLMResult:
     """Structured response from an LLM agent call."""
+
     verdict: str  # PASS | WARN | FAIL
     narrative: str
     recommendations: list[str]
     confidence_basis: str
     raw_response: str
-    used_llm: bool  # True if real LLM call, False if fallback
+    used_llm: bool = True  # phase-1/phase-2 are always True; lifecycle fallback may set False
 
 
 def fallback_result(verdict: str, narrative: str = "") -> LLMResult:
-    """Construct a deterministic-only result when LLM is unavailable."""
+    """Construct an advisory result when LLM is unavailable (lifecycle only)."""
     return LLMResult(
         verdict=verdict,
         narrative=narrative or "(LLM unavailable — deterministic verdict only)",
@@ -58,19 +77,88 @@ def fallback_result(verdict: str, narrative: str = "") -> LLMResult:
     )
 
 
+def _call_claude_raw(
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    max_tokens: int = 1500,
+) -> str:
+    """Call Anthropic API via raw HTTPS — no SDK required.
+
+    Raises LLMUnavailableError if API key is missing.
+    Raises urllib.error.HTTPError on API errors.
+    """
+    api_key = require_api_key()
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    req = urllib.request.Request(
+        API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Api-Key": api_key,
+            "Anthropic-Version": API_VERSION,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content_blocks = body.get("content", [])
+    text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
+    return "".join(text_parts).strip()
+
+
+def _parse_json_response(raw: str) -> dict:
+    """Parse JSON from response, tolerating markdown fences."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError:
+                pass
+        text_low = text.lower()
+        if "fail" in text_low:
+            v = "FAIL"
+        elif "warn" in text_low:
+            v = "WARN"
+        else:
+            v = "WARN"  # safe default when parse fails
+        return {
+            "verdict": v,
+            "narrative": raw[:500],
+            "recommendations": [],
+            "confidence_basis": "(parse failed, defaulted to WARN)",
+        }
+
+
 class LLMAgent:
-    """Persistent LLM-driven agent with role prompt + identity awareness.
+    """A REAL LLM-driven agent with persistent project identity.
 
-    Each invocation:
-    1. Reads agent identity from Model Keeper (recent_findings, specializations_learned, tenure)
-    2. Constructs role-aware prompt + the deterministic data + identity history
-    3. Calls Claude
-    4. Parses structured JSON response
-    5. Returns LLMResult
+    Each agent has TWO main methods for verification:
+    - investigate(): phase-1 independent findings
+    - team_review(): phase-2 commentary on the whole team's findings
 
-    This is NOT a subagent — there is no per-task spawn. The agent's identity
-    persists across runs via Model Keeper. Each LLMAgent instance just borrows
-    that identity for one call.
+    The legacy ``think()`` method is preserved for lifecycle commands
+    (brainstorm/requirements/design-review/reflection) which are advisory and
+    permit graceful fallback when no API key is set.
+
+    Identity persists across runs via Model Keeper. The agent's tenure (total
+    invocations, accumulated specializations, recent findings) is passed into
+    every prompt so the LLM reasons WITH that history, not as a fresh subagent.
     """
 
     def __init__(
@@ -79,11 +167,72 @@ class LLMAgent:
         role_prompt: str,
         model: str = HAIKU,
         max_tokens: int = 1500,
-    ):
+    ) -> None:
         self.role_name = role_name
         self.role_prompt = role_prompt
         self.model = model
         self.max_tokens = max_tokens
+
+    # ------------------------------------------------------------------
+    # v3 mandatory two-phase methods
+    # ------------------------------------------------------------------
+
+    def investigate(
+        self,
+        deterministic_data: dict,
+        identity_record: dict,
+        project_context: Optional[str] = None,
+    ) -> LLMResult:
+        """Phase 1: investigate independently. Returns structured finding."""
+        prompt = self._build_investigate_prompt(
+            deterministic_data, identity_record, project_context
+        )
+        raw = _call_claude_raw(
+            self.model, self.role_prompt, prompt, self.max_tokens
+        )
+        parsed = _parse_json_response(raw)
+        return LLMResult(
+            verdict=parsed.get("verdict", "WARN"),
+            narrative=parsed.get("narrative", ""),
+            recommendations=parsed.get("recommendations", []),
+            confidence_basis=parsed.get("confidence_basis", ""),
+            raw_response=raw,
+            used_llm=True,
+        )
+
+    def team_review(
+        self,
+        my_phase1: LLMResult,
+        team_findings: dict,  # {agent_role: LLMResult}
+        identity_record: dict,
+    ) -> LLMResult:
+        """Phase 2: review the team's findings, respond / escalate / agree."""
+        prompt = self._build_review_prompt(my_phase1, team_findings, identity_record)
+        review_system = (
+            self.role_prompt
+            + "\n\n"
+            + "You are now in the TEAM REVIEW phase. The team has shared their independent "
+            "findings. Your job: look at the cross-cutting picture. Do your phase-1 "
+            "conclusions still hold? Did anyone find something that requires you to "
+            "escalate? Did anyone find a false positive you can help reframe? Speak as "
+            "a teammate — reference specific agents by role when relevant."
+        )
+        raw = _call_claude_raw(
+            self.model, review_system, prompt, self.max_tokens
+        )
+        parsed = _parse_json_response(raw)
+        return LLMResult(
+            verdict=parsed.get("verdict", my_phase1.verdict),
+            narrative=parsed.get("narrative", ""),
+            recommendations=parsed.get("recommendations", []),
+            confidence_basis=parsed.get("confidence_basis", ""),
+            raw_response=raw,
+            used_llm=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Backward-compatible advisory call for lifecycle commands
+    # ------------------------------------------------------------------
 
     def think(
         self,
@@ -91,48 +240,36 @@ class LLMAgent:
         identity_record: dict,
         project_context: Optional[str] = None,
     ) -> LLMResult:
-        """Produce an LLM-driven judgment on top of deterministic data.
+        """Advisory call — graceful fallback when no API key.
 
-        Returns LLMResult. If LLM unavailable, returns fallback_result based
-        on the deterministic verdict.
+        Used by lifecycle commands (brainstorm/requirements/design-review/
+        reflection) which are NOT gated by mandatory LLM. Verification flows
+        must call ``investigate()`` / ``team_review()`` instead.
         """
-        # Extract deterministic verdict to use as fallback
         det_verdict = deterministic_data.get("verdict", "WARN")
         det_narrative = deterministic_data.get("summary_line", "")
-
         if not llm_available():
             return fallback_result(det_verdict, det_narrative)
-
         try:
-            import anthropic
-        except ImportError:
+            return self.investigate(
+                deterministic_data, identity_record, project_context
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory path
+            print(
+                f"[{self.role_name}-llm] advisory call failed: {exc}",
+                file=sys.stderr,
+            )
             return fallback_result(det_verdict, det_narrative)
 
-        prompt = self._build_prompt(deterministic_data, identity_record, project_context)
+    # Compatibility shim for older tests
+    def _parse_response(self, raw: str) -> dict:
+        return _parse_json_response(raw)
 
-        try:
-            client = anthropic.Anthropic()
-            message = client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.role_prompt,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text.strip()
-            parsed = self._parse_response(raw)
-            return LLMResult(
-                verdict=parsed.get("verdict", det_verdict),
-                narrative=parsed.get("narrative", det_narrative),
-                recommendations=parsed.get("recommendations", []),
-                confidence_basis=parsed.get("confidence_basis", ""),
-                raw_response=raw,
-                used_llm=True,
-            )
-        except Exception as e:
-            print(f"[{self.role_name}-llm] API call failed: {e}", file=sys.stderr)
-            return fallback_result(det_verdict, det_narrative)
+    # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
 
-    def _build_prompt(
+    def _build_investigate_prompt(
         self,
         deterministic_data: dict,
         identity_record: dict,
@@ -140,72 +277,90 @@ class LLMAgent:
     ) -> str:
         invocations = identity_record.get("total_invocations", 0)
         tenure = identity_record.get("tenure_score", 0.0)
-        recent_findings = identity_record.get("recent_findings", [])[-3:]
-        specializations = identity_record.get("specializations_learned", [])[-5:]
+        recent = identity_record.get("recent_findings", [])[-3:]
+        specs = identity_record.get("specializations_learned", [])[-5:]
 
-        recent_str = "\n".join(
-            f"  - run {f.get('run_id', '?')[:20]}: verdict={f.get('verdict', '?')}, "
-            f"observation={f.get('key_observation', '')[:120]}"
-            for f in recent_findings
-        ) or "  (no prior findings — first invocation)"
-
-        specs_str = "\n".join(f"  - {s}" for s in specializations) or "  (none learned yet)"
+        recent_str = (
+            "\n".join(
+                f"  - {f.get('run_id', '?')[:24]}: verdict={f.get('verdict', '?')}, "
+                f"obs={f.get('key_observation', '')[:120]}"
+                for f in recent
+            )
+            or "  (no prior findings — first invocation on this project)"
+        )
+        specs_str = (
+            "\n".join(f"  - {s}" for s in specs) or "  (none learned yet)"
+        )
 
         det_summary = json.dumps(
-            {k: v for k, v in deterministic_data.items() if k != "raw_response"},
+            {k: v for k, v in deterministic_data.items()},
             indent=2,
             default=str,
         )[:3000]
 
         ctx_section = ""
         if project_context:
-            ctx_section = f"\n\nProject context (excerpt):\n```\n{project_context[:2000]}\n```\n"
+            ctx_section = (
+                f"\nProject context:\n```\n{project_context[:2000]}\n```\n"
+            )
 
-        return f"""You are {self.role_name}, a persistent member of this project's EGV (Evidence-Grounded Verification) team.
-
-Your tenure on this project:
-- Total prior invocations: {invocations}
-- Tenure score: {tenure:.2f}
-- Recent findings (last 3):
+        return f"""Your tenure on this project:
+- Total prior invocations: {invocations} | Tenure score: {tenure:.2f}
+- Recent findings:
 {recent_str}
-- Specializations learned on this project:
+- Specializations learned:
 {specs_str}
-
-You have been given DETERMINISTIC data computed by your sensors (regex/coverage/typecheck/etc.). Your job is to interpret it in the context of this project, accumulated knowledge, and produce a judgment.{ctx_section}
-
-Deterministic data from this invocation:
+{ctx_section}
+Your sensors gathered the following deterministic data this run:
 {det_summary}
 
-Respond as a strict JSON object with these keys:
+Investigate. Produce a structured judgment as strict JSON:
 {{
   "verdict": "PASS" | "WARN" | "FAIL",
-  "narrative": "1-3 sentences explaining what you observed in plain English. Reference specific findings.",
-  "recommendations": ["1-3 actionable next steps if WARN/FAIL, empty array if PASS"],
-  "confidence_basis": "1 sentence explaining why you chose this verdict — cite specific deterministic facts"
+  "narrative": "2-4 sentences. What you observed. Reference specific files/numbers/symptoms. Speak in first person as your role.",
+  "recommendations": ["Concrete next actions if WARN/FAIL. Empty list if PASS."],
+  "confidence_basis": "1 sentence explaining how the sensor data + your historical context support this verdict."
 }}
 
-Output ONLY the JSON, no preamble. Be honest — if the deterministic data is ambiguous, say WARN. If it's clearly clean, say PASS. Never claim FAIL without specific evidence in the data."""
+Output JSON only, no preamble."""
 
-    def _parse_response(self, raw: str) -> dict:
-        """Parse JSON from response, tolerating wrapping markdown fences."""
-        text = raw.strip()
-        # Strip ```json fences if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Try to find a JSON object in the response
-            import re
-            m = re.search(r"\{[\s\S]*\}", text)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    pass
-            return {"narrative": text[:500]}
+    def _build_review_prompt(
+        self,
+        my_phase1: LLMResult,
+        team_findings: dict,
+        identity_record: dict,
+    ) -> str:
+        team_summary = "\n\n".join(
+            f"## {role} said:\n"
+            f"  verdict: {result.verdict}\n"
+            f"  narrative: {result.narrative}\n"
+            f"  recommendations: {result.recommendations}"
+            for role, result in team_findings.items()
+        )
+
+        return f"""TEAM REVIEW PHASE.
+
+Your phase-1 finding (which you submitted independently):
+  verdict: {my_phase1.verdict}
+  narrative: {my_phase1.narrative}
+  recommendations: {my_phase1.recommendations}
+
+The full team's phase-1 findings:
+
+{team_summary}
+
+Now reflect. Possible responses:
+- STAND BY: your verdict still holds, the team agrees, brief confirmation
+- ESCALATE: another agent found something that forces you to upgrade your verdict (PASS->WARN or WARN->FAIL)
+- DE-ESCALATE: your phase-1 was alarmist; another agent reframed it as a false positive
+- CROSS-CONCERN: you noticed a pattern across multiple agents that nobody named explicitly
+
+Respond as strict JSON:
+{{
+  "verdict": "PASS" | "WARN" | "FAIL",
+  "narrative": "2-4 sentences as a teammate. Reference other agents by role. Say what changed (or didn't) and why.",
+  "recommendations": ["Updated actions. Can be empty if all clear."],
+  "confidence_basis": "1 sentence — what in the team's findings supports this final position."
+}}
+
+Output JSON only."""

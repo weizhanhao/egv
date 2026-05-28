@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""
-run-egv.py — POC orchestrator.
+"""run-egv.py — EGV v3 REAL agent team orchestrator.
 
-Runs the EGV verification team end-to-end for a given commit (or diff).
-v0 POC: role-rotates within one process (no real subagent dispatch — equivalent
-architecture, faster execution).
+Every verification run is a three-phase team meeting:
 
-Pipeline:
-  1. Generate diff (from commit SHA, or read from file)
-  2. Regression Auditor:
-     - Run coverage-diff.ts → blast-radius.json
-     - Classify per file (covered / uncovered / test_file_excluded / not_in_coverage)
-     - Compute auditor confidence + verdict
-  3. Critical Path Sentinel:
-     - Read critical_flows from Model Keeper
-     - Run vitest for each flow's test_path
-     - Compute sentinel confidence + verdict
-  4. QA Lead synthesis:
-     - Detect disagreement between auditor and sentinel
-     - Compute combined verdict + confidence
-     - Write human-readable verdict.md
+  Phase 1 — Independent investigation
+    Each of the 6 specialist agents (Auditor, Sentinel, Contract, Performance,
+    Security, A11y) runs its sensors AND consults Claude with role prompt +
+    accumulated identity. The result is a structured finding: verdict,
+    narrative, recommendations.
+
+  Phase 2 — Team review
+    Each agent gets shown ALL six phase-1 findings. They respond as teammates:
+    STAND BY / ESCALATE / DE-ESCALATE / CROSS-CONCERN. This is the real team
+    part — verdicts can move based on cross-cutting signal.
+
+  Phase 3 — QA Lead synthesis
+    The QA Lead (also LLM) reads both phases and produces the final verdict
+    with narrative explaining how the team converged (or didn't).
+
+LLM is MANDATORY. Missing ANTHROPIC_API_KEY = clear FATAL error, exit 2.
+No SDK required (raw urllib HTTPS to Anthropic API).
 
 Usage:
-  python3 run-egv.py <commit-sha-or-diff-path> [--project excalidraw]
+  ANTHROPIC_API_KEY=sk-ant-... python3 run-egv.py <commit-sha-or-diff-path> \\
+      --project-root /path/to/project [--selected-flows name1,name2]
 
-Output: reports/<run_id>/
+Output: reports/<run_id>/{verdict.md, verdict.json, <agent>.json, <agent>-review.json}
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -41,18 +44,85 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent_identity import read_agent_identity, write_agent_identity
-from llm import LLMAgent, HAIKU, SONNET
+from llm import (
+    HAIKU,
+    SONNET,
+    LLMAgent,
+    LLMResult,
+    LLMUnavailableError,
+    require_api_key,
+)
 from model_keeper import (
-    CURRENT_SCHEMA_VERSION,
     keeper_path_for_project_root,
     load_model_keeper,
     now_iso,
-    provenance_stamp,
     save_model_keeper,
 )
 
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------------------
+# Agent role registry — used by phase-2 team review
+# ---------------------------------------------------------------------------
+
+AGENT_ROLES: dict[str, tuple[str, str, str, str]] = {
+    # role_key: (display_role_name, identity_key, model, role_prompt)
+    "auditor": (
+        "Regression Auditor",
+        "regression-auditor",
+        SONNET,
+        "You are the Regression Auditor for this project's EGV team. You judge "
+        "whether code changes are safe based on coverage x diff data. You speak "
+        "in concrete terms about specific files and modules. You measure blast "
+        "radius before claiming safety.",
+    ),
+    "sentinel": (
+        "Critical Path Sentinel",
+        "critical-path-sentinel",
+        HAIKU,
+        "You are the Critical Path Sentinel. You run the project's real "
+        "core-flow tests and report on pass/fail/missing. You care about which "
+        "user-visible behaviors are verified end-to-end.",
+    ),
+    "contract": (
+        "Contract Sentinel",
+        "contract-sentinel",
+        HAIKU,
+        "You are the Contract Sentinel. You watch for type/schema breakage. "
+        "Errors INSIDE the diff are blocking; pre-existing errors are noise.",
+    ),
+    "perf": (
+        "Performance Watch",
+        "performance-watch",
+        HAIKU,
+        "You are Performance Watch. You compare run timings against rolling "
+        "p50 baselines and flag regressions >= 25%. You don't get excited "
+        "about noise on tiny baselines.",
+    ),
+    "security": (
+        "Security Scout",
+        "security-scout",
+        HAIKU,
+        "You are the Security Scout. Regex caught what regex catches. Look at "
+        "diff additions for things regex CAN'T catch: subtle injection patterns, "
+        "unsafe deserialization, JWT misuse, weak crypto. Be specific.",
+    ),
+    "a11y": (
+        "A11y Auditor",
+        "a11y-auditor",
+        HAIKU,
+        "You are the A11y Auditor. You scan UI diff additions for common "
+        "accessibility anti-patterns. You stay advisory — cap your verdict at "
+        "WARN unless something genuinely breaks assistive tech.",
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def make_run_id(commit_or_diff: str) -> str:
@@ -62,27 +132,32 @@ def make_run_id(commit_or_diff: str) -> str:
 
 
 def get_diff(arg: str, project_root: Path) -> Path:
-    """If arg is a commit SHA, generate diff. If file path, return it."""
     if os.path.isfile(arg):
         return Path(arg).resolve()
     diff_path = Path(f"/tmp/egv-diff-{arg}.patch")
     subprocess.run(
-        ["git", "-C", str(project_root), "diff", "--unified=0", "--no-color",
-         f"{arg}~1..{arg}"],
-        check=True, stdout=diff_path.open("w"),
+        [
+            "git",
+            "-C",
+            str(project_root),
+            "diff",
+            "--unified=0",
+            "--no-color",
+            f"{arg}~1..{arg}",
+        ],
+        check=True,
+        stdout=diff_path.open("w"),
     )
     return diff_path
 
 
 def _make_weight_lookup(weights: dict):
-    """Return a function(path) -> float using glob patterns from the keeper."""
     import fnmatch
 
     patterns = weights.get("patterns", [])
     default = weights.get("default", 1.0)
 
     def _glob_match(path: str, glob: str) -> bool:
-        # Expand brace alternations like {ts,tsx} into multiple globs.
         if "{" in glob and "}" in glob:
             prefix, rest = glob.split("{", 1)
             alts_str, suffix = rest.split("}", 1)
@@ -101,17 +176,43 @@ def _make_weight_lookup(weights: dict):
     return lookup
 
 
+def _llm_result_to_dict(r: LLMResult) -> dict:
+    return {
+        "verdict": r.verdict,
+        "narrative": r.narrative,
+        "recommendations": r.recommendations,
+        "confidence_basis": r.confidence_basis,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Independent investigation (one function per agent)
+# ---------------------------------------------------------------------------
+
+
+def _make_agent(role_key: str) -> LLMAgent:
+    role_name, _identity_key, model, prompt = AGENT_ROLES[role_key]
+    return LLMAgent(role_name=role_name, role_prompt=prompt, model=model)
+
+
 def run_regression_auditor(
-    diff_path: Path, coverage_path: Path, project_root: Path, run_dir: Path,
+    diff_path: Path,
+    coverage_path: Path,
+    project_root: Path,
+    run_dir: Path,
     model_keeper: dict,
 ) -> dict:
-    """Layer 1: coverage × diff. Outputs auditor verdict."""
-    print(f"[auditor] Running coverage-diff on {diff_path.name}...", file=sys.stderr)
+    print(
+        f"[auditor] Running coverage-diff on {diff_path.name}...",
+        file=sys.stderr,
+    )
 
     agent_record = read_agent_identity(model_keeper, "regression-auditor")
     agent_record["total_invocations"] += 1
 
-    weights = model_keeper.get("file_importance_weights", {"patterns": [], "default": 1.0})
+    weights = model_keeper.get(
+        "file_importance_weights", {"patterns": [], "default": 1.0}
+    )
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as wf:
         json.dump(weights, wf)
         weights_path = wf.name
@@ -119,22 +220,35 @@ def run_regression_auditor(
     blast_path = run_dir / "blast-radius.json"
 
     result = subprocess.run(
-        ["npx", "--yes", "tsx@4", str(SKILL_ROOT / "lib" / "coverage-diff.ts"),
-         str(diff_path), str(coverage_path), str(project_root),
-         "--weights", weights_path],
-        capture_output=True, text=True, check=True,
+        [
+            "npx",
+            "--yes",
+            "tsx@4",
+            str(SKILL_ROOT / "lib" / "coverage-diff.ts"),
+            str(diff_path),
+            str(coverage_path),
+            str(project_root),
+            "--weights",
+            weights_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     blast_path.write_text(result.stdout)
     blast = json.loads(result.stdout)
     summary = blast["summary"]
 
-    coverage_ratio = summary.get("weighted_coverage_ratio", summary["coverage_ratio"])
+    coverage_ratio = summary.get(
+        "weighted_coverage_ratio", summary["coverage_ratio"]
+    )
     age = blast["confidence_inputs"].get("coverage_data_age_seconds") or 99999
     data_freshness = 1.0 if age < 3600 else 0.7
     test_pass_rate = 1.0
-    confidence = round(min(0.95, coverage_ratio * test_pass_rate * data_freshness), 2)
+    confidence = round(
+        min(0.95, coverage_ratio * test_pass_rate * data_freshness), 2
+    )
 
-    # Weighted-aware verdict: only flag WARN when production-weighted lines are uncovered.
     weighted_prod_lines = summary.get(
         "weighted_production_changed_lines", summary["production_changed_lines"]
     )
@@ -144,26 +258,29 @@ def run_regression_auditor(
     weighted_uncovered = weighted_prod_lines - weighted_covered_lines
 
     if weighted_uncovered > 0:
-        verdict = "WARN"
+        det_verdict = "WARN"
     elif weighted_prod_lines == 0:
-        verdict = "PASS"
+        det_verdict = "PASS"
         confidence = 0.95
     else:
-        verdict = "PASS"
+        det_verdict = "PASS"
 
     weight_for = _make_weight_lookup(weights)
-    warnings = []
+    warnings: list[str] = []
     for f in blast["files"]:
         if f["is_test_file"]:
             continue
         w = weight_for(f["file"])
         if w == 0.0:
-            continue  # zero-weight files (types, snapshots) are not risk signals
+            continue
         if f["coverage_status"] in ("uncovered", "not_in_coverage"):
             warnings.append(
                 f"{f['file']}: {len(f['uncovered_lines'])} changed lines have no test coverage"
             )
-        elif f["coverage_status"] == "partially_covered" and len(f["uncovered_lines"]) > 0:
+        elif (
+            f["coverage_status"] == "partially_covered"
+            and len(f["uncovered_lines"]) > 0
+        ):
             warnings.append(
                 f"{f['file']}: {len(f['uncovered_lines'])} of {len(f['changed_lines'])} changed lines uncovered"
             )
@@ -171,11 +288,11 @@ def run_regression_auditor(
     report = {
         "agent": "regression-auditor",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
-            f"weighted_coverage_ratio={coverage_ratio:.2f} × test_pass_rate={test_pass_rate} × "
-            f"data_freshness={data_freshness} → "
+            f"weighted_coverage_ratio={coverage_ratio:.2f} x test_pass_rate={test_pass_rate} x "
+            f"data_freshness={data_freshness} -> "
             f"{coverage_ratio * test_pass_rate * data_freshness:.2f} (capped at 0.95)"
         ),
         "blast_radius": {
@@ -194,73 +311,51 @@ def run_regression_auditor(
                 for f in blast["files"]
             ],
         },
-        "evidence": [
-            str(blast_path),
-            str(coverage_path),
-        ],
+        "evidence": [str(blast_path), str(coverage_path)],
         "warnings": warnings,
         "generated_at": now_iso(),
     }
+
+    # Phase 1 LLM investigation — MANDATORY
+    auditor_agent = _make_agent("auditor")
+    phase1 = auditor_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "deterministic_confidence": confidence,
+            "blast_radius": report["blast_radius"],
+            "warnings": warnings,
+            "summary": (
+                f"{summary['production_changed_lines']} prod lines changed, "
+                f"{summary['covered_changed_lines']} covered, "
+                f"{coverage_ratio:.0%} ratio"
+            ),
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["confidence"] = round(min(report["confidence"], 0.85), 2)
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     auditor_path = run_dir / "regression-auditor.json"
     auditor_path.write_text(json.dumps(report, indent=2))
-    print(f"[auditor] verdict={verdict} confidence={confidence}", file=sys.stderr)
-
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": (warnings[0] if warnings else "no warnings"),
-    })
-    write_agent_identity(model_keeper, "regression-auditor", agent_record)
-
-    # LLM reasoning layer (v3) — turn deterministic data into agent judgment
-    auditor_llm = LLMAgent(
-        role_name="Regression Auditor",
-        role_prompt=(
-            "You are the Regression Auditor for this project's EGV team. "
-            "Your job: judge whether code changes are safe based on coverage × diff data. "
-            "You speak in concrete terms about specific files and modules. "
-            "You DO NOT claim safety you cannot prove — you measure blast radius first."
-        ),
-        model=SONNET,
+    print(
+        f"[auditor] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
+        file=sys.stderr,
     )
-    det_data = {
-        "verdict": verdict,
-        "confidence": confidence,
-        "summary_line": f"{summary['production_changed_lines']} production lines changed, {summary['covered_changed_lines']} covered ({coverage_ratio:.0%})",
-        "blast_radius": report["blast_radius"],
-        "warnings": warnings,
+
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "Regression Auditor",
     }
-    llm_judgment = auditor_llm.think(det_data, agent_record)
-    if llm_judgment.used_llm:
-        # Layer LLM reasoning on top — but never lower a FAIL to PASS based on LLM
-        if llm_judgment.verdict in ("PASS", "WARN", "FAIL"):
-            llm_rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
-            det_rank = llm_rank.get(verdict, 1)
-            new_rank = llm_rank.get(llm_judgment.verdict, det_rank)
-            # Take the higher concern level — agent can ESCALATE deterministic but not de-escalate
-            if new_rank > det_rank:
-                report["verdict"] = llm_judgment.verdict
-                report["confidence"] = round(min(confidence, 0.85), 2)
-        report["llm_narrative"] = llm_judgment.narrative
-        report["llm_recommendations"] = llm_judgment.recommendations
-        report["llm_confidence_basis"] = llm_judgment.confidence_basis
-    else:
-        report["llm_narrative"] = llm_judgment.narrative  # fallback message
-
-    # Re-write file with LLM additions
-    auditor_path.write_text(json.dumps(report, indent=2))
-    if llm_judgment.used_llm:
-        print(f"[auditor-llm] {llm_judgment.narrative[:120]}", file=sys.stderr)
-
-    return report
 
 
 def run_critical_path_sentinel(
-    model_keeper: dict, project_root: Path, run_dir: Path,
+    model_keeper: dict,
+    project_root: Path,
+    run_dir: Path,
     selected_flows: list | None = None,
 ) -> dict:
-    """Run the critical flow tests."""
     print("[sentinel] Running critical path tests...", file=sys.stderr)
 
     agent_record = read_agent_identity(model_keeper, "critical-path-sentinel")
@@ -274,14 +369,16 @@ def run_critical_path_sentinel(
     for flow in flows:
         test_path = flow.get("test_path")
         if not test_path:
-            results.append({
-                "flow_name": flow["name"],
-                "test_path": None,
-                "status": "missing",
-                "duration_ms": 0,
-                "evidence_path": None,
-                "failure_excerpt": "test_path not configured in Model Keeper",
-            })
+            results.append(
+                {
+                    "flow_name": flow["name"],
+                    "test_path": None,
+                    "status": "missing",
+                    "duration_ms": 0,
+                    "evidence_path": None,
+                    "failure_excerpt": "test_path not configured in Model Keeper",
+                }
+            )
             continue
 
         flow_log = run_dir / f"flow-{flow['name']}.log"
@@ -289,36 +386,44 @@ def run_critical_path_sentinel(
         sentinel_cmd_template = model_keeper.get("framework_config", {}).get(
             "sentinel_test_command", "yarn test:app --run {test_path}"
         )
-        # Template uses {test_path} placeholder
         sentinel_cmd = sentinel_cmd_template.format(test_path=test_path)
         rc = subprocess.call(
-            sentinel_cmd, shell=True,
+            sentinel_cmd,
+            shell=True,
             cwd=str(project_root),
-            stdout=flow_log.open("w"), stderr=subprocess.STDOUT,
+            stdout=flow_log.open("w"),
+            stderr=subprocess.STDOUT,
         )
         duration_ms = int((time.time() - start) * 1000)
 
         if rc == 0:
-            results.append({
-                "flow_name": flow["name"],
-                "test_path": test_path,
-                "status": "passed",
-                "duration_ms": duration_ms,
-                "evidence_path": str(flow_log),
-                "failure_excerpt": None,
-            })
-            print(f"[sentinel] PASS {flow['name']} ({duration_ms}ms)", file=sys.stderr)
+            results.append(
+                {
+                    "flow_name": flow["name"],
+                    "test_path": test_path,
+                    "status": "passed",
+                    "duration_ms": duration_ms,
+                    "evidence_path": str(flow_log),
+                    "failure_excerpt": None,
+                }
+            )
+            print(
+                f"[sentinel] PASS {flow['name']} ({duration_ms}ms)",
+                file=sys.stderr,
+            )
         else:
             log_tail = flow_log.read_text().split("\n")[-30:]
             excerpt = "\n".join(log_tail)
-            results.append({
-                "flow_name": flow["name"],
-                "test_path": test_path,
-                "status": "failed",
-                "duration_ms": duration_ms,
-                "evidence_path": str(flow_log),
-                "failure_excerpt": excerpt[:500],
-            })
+            results.append(
+                {
+                    "flow_name": flow["name"],
+                    "test_path": test_path,
+                    "status": "failed",
+                    "duration_ms": duration_ms,
+                    "evidence_path": str(flow_log),
+                    "failure_excerpt": excerpt[:500],
+                }
+            )
             print(f"[sentinel] FAIL {flow['name']} (rc={rc})", file=sys.stderr)
 
     verifiable = [r for r in results if r["status"] != "missing"]
@@ -326,27 +431,33 @@ def run_critical_path_sentinel(
     failed = [r for r in results if r["status"] == "failed"]
     missing = [r for r in results if r["status"] == "missing"]
 
-    verified_pass_ratio = (len(passed) / len(verifiable)) if verifiable else 0.0
-    unverifiable_penalty = (len(missing) / len(results)) if results else 0.0
-    confidence = round(min(0.95, verified_pass_ratio * (1 - 0.5 * unverifiable_penalty)), 2)
+    verified_pass_ratio = (
+        (len(passed) / len(verifiable)) if verifiable else 0.0
+    )
+    unverifiable_penalty = (
+        (len(missing) / len(results)) if results else 0.0
+    )
+    confidence = round(
+        min(0.95, verified_pass_ratio * (1 - 0.5 * unverifiable_penalty)), 2
+    )
 
     if failed:
-        verdict = "FAIL"
+        det_verdict = "FAIL"
     elif missing:
-        verdict = "WARN"
+        det_verdict = "WARN"
     elif passed:
-        verdict = "PASS"
+        det_verdict = "PASS"
     else:
-        verdict = "WARN"
+        det_verdict = "WARN"
 
     report = {
         "agent": "critical-path-sentinel",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
-            f"verified_pass_ratio={verified_pass_ratio:.2f} × "
-            f"(1 - 0.5 × unverifiable_penalty={unverifiable_penalty:.2f}) = "
+            f"verified_pass_ratio={verified_pass_ratio:.2f} x "
+            f"(1 - 0.5 x unverifiable_penalty={unverifiable_penalty:.2f}) = "
             f"{verified_pass_ratio * (1 - 0.5 * unverifiable_penalty):.2f} (capped at 0.95)"
         ),
         "flows_total": len(results),
@@ -355,32 +466,52 @@ def run_critical_path_sentinel(
         "flows_failed": len(failed),
         "results": results,
         "evidence": [r["evidence_path"] for r in results if r["evidence_path"]],
-        "feed_to_model_keeper": {
-            "flows_to_update_last_verified": [r["flow_name"] for r in passed],
-            "flows_with_missing_test_paths": [r["flow_name"] for r in missing],
-        },
         "generated_at": now_iso(),
     }
+
+    sentinel_agent = _make_agent("sentinel")
+    phase1 = sentinel_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "flows_total": len(results),
+            "flows_passed": len(passed),
+            "flows_failed": len(failed),
+            "flows_missing": len(missing),
+            "results_summary": [
+                {
+                    "name": r["flow_name"],
+                    "status": r["status"],
+                    "duration_ms": r["duration_ms"],
+                    "failure_excerpt": (r.get("failure_excerpt") or "")[:240],
+                }
+                for r in results
+            ],
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     sentinel_path = run_dir / "critical-path-sentinel.json"
     sentinel_path.write_text(json.dumps(report, indent=2))
-    print(f"[sentinel] verdict={verdict} confidence={confidence}", file=sys.stderr)
+    print(
+        f"[sentinel] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
+        file=sys.stderr,
+    )
 
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": f"{len(passed)} flows passed, {len(failed)} failed, {len(missing)} missing",
-    })
-    write_agent_identity(model_keeper, "critical-path-sentinel", agent_record)
-
-    return report
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "Critical Path Sentinel",
+    }
 
 
 def run_contract_sentinel(
-    diff_path: Path, project_root: Path, run_dir: Path, model_keeper: dict,
+    diff_path: Path,
+    project_root: Path,
+    run_dir: Path,
+    model_keeper: dict,
 ) -> dict:
-    """Type/schema breakage detector. Runs the project's typecheck command and
-    correlates errors with the diff file paths."""
     print("[contract] Running typecheck...", file=sys.stderr)
 
     agent_record = read_agent_identity(model_keeper, "contract-sentinel")
@@ -392,12 +523,14 @@ def run_contract_sentinel(
 
     log_path = run_dir / "contract-typecheck.log"
     rc = subprocess.call(
-        typecheck_cmd, shell=True, cwd=str(project_root),
-        stdout=log_path.open("w"), stderr=subprocess.STDOUT,
+        typecheck_cmd,
+        shell=True,
+        cwd=str(project_root),
+        stdout=log_path.open("w"),
+        stderr=subprocess.STDOUT,
     )
     log_text = log_path.read_text()
 
-    # Parse TypeScript errors: lines like "path/to/file.ts(123,45): error TS2304: Cannot find name 'foo'."
     error_pattern = re.compile(
         r"^(?P<file>[^\s(]+\.tsx?)\((?P<line>\d+),(?P<col>\d+)\):\s+error\s+(?P<code>TS\d+):\s+(?P<msg>.+)$",
         re.MULTILINE,
@@ -412,48 +545,58 @@ def run_contract_sentinel(
         for m in error_pattern.finditer(log_text)
     ]
 
-    # Identify which diff files have errors
     diff_text = diff_path.read_text()
-    diff_files = set()
+    diff_files: set[str] = set()
     for line in diff_text.split("\n"):
         m = re.match(r"^\+\+\+ b/(.+)$", line)
         if m:
             diff_files.add(m.group(1))
     errors_in_diff = [
-        e for e in all_errors
-        if any(e["file"].endswith(df) or df.endswith(e["file"]) for df in diff_files)
+        e
+        for e in all_errors
+        if any(
+            e["file"].endswith(df) or df.endswith(e["file"]) for df in diff_files
+        )
     ]
 
     if rc != 0 and not all_errors:
-        verdict = "FAIL"
+        det_verdict = "FAIL"
         confidence = 0.0
         warnings_list = [
-            "Typecheck command exited non-zero but produced no parseable errors. Manual investigation required."
+            "Typecheck exited non-zero but produced no parseable errors. Manual investigation required."
         ]
     elif errors_in_diff:
-        verdict = "WARN"
-        confidence = round(min(0.95, len(errors_in_diff) / max(1, len(all_errors)) * 0.95), 2)
+        det_verdict = "WARN"
+        confidence = round(
+            min(
+                0.95,
+                len(errors_in_diff) / max(1, len(all_errors)) * 0.95,
+            ),
+            2,
+        )
         warnings_list = [
-            f"{e['file']}:{e['line']} — {e['code']}: {e['msg'][:120]}"
+            f"{e['file']}:{e['line']} -- {e['code']}: {e['msg'][:120]}"
             for e in errors_in_diff[:5]
         ]
     elif all_errors:
-        verdict = "WARN"
-        confidence = 0.7  # there are errors but not in our diff — pre-existing
-        warnings_list = [f"{len(all_errors)} pre-existing TS errors in repo (not caused by this diff)"]
+        det_verdict = "WARN"
+        confidence = 0.7
+        warnings_list = [
+            f"{len(all_errors)} pre-existing TS errors in repo (not caused by this diff)"
+        ]
     else:
-        verdict = "PASS"
+        det_verdict = "PASS"
         confidence = 0.95
         warnings_list = []
 
     report = {
         "agent": "contract-sentinel",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
             f"errors_in_diff={len(errors_in_diff)} / total_errors={len(all_errors)}, "
-            f"verdict={verdict}"
+            f"verdict={det_verdict}"
         ),
         "errors_in_diff_files": errors_in_diff[:20],
         "total_typecheck_errors": len(all_errors),
@@ -461,48 +604,61 @@ def run_contract_sentinel(
         "warnings": warnings_list,
         "generated_at": now_iso(),
     }
+
+    contract_agent = _make_agent("contract")
+    phase1 = contract_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "typecheck_exit_code": rc,
+            "errors_in_diff_count": len(errors_in_diff),
+            "errors_in_diff_sample": errors_in_diff[:10],
+            "preexisting_errors_total": len(all_errors),
+            "diff_files_count": len(diff_files),
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     contract_path = run_dir / "contract-sentinel.json"
     contract_path.write_text(json.dumps(report, indent=2))
     print(
-        f"[contract] verdict={verdict} confidence={confidence} "
-        f"(errors_in_diff={len(errors_in_diff)}/{len(all_errors)})",
+        f"[contract] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
         file=sys.stderr,
     )
 
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": (warnings_list[0] if warnings_list else "no typecheck errors"),
-    })
-    write_agent_identity(model_keeper, "contract-sentinel", agent_record)
-
-    return report
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "Contract Sentinel",
+    }
 
 
 def run_performance_watch(
-    sentinel_report: dict, run_dir: Path, model_keeper: dict,
+    sentinel_det: dict,
+    run_dir: Path,
+    model_keeper: dict,
 ) -> dict:
-    """Compare this run's critical flow durations against per-flow baselines.
-    Updates baselines (rolling p50). Flags WARN if any flow is >=25% slower than baseline."""
-    print("[perfwatch] Comparing flow durations to baselines...", file=sys.stderr)
+    print(
+        "[perfwatch] Comparing flow durations to baselines...",
+        file=sys.stderr,
+    )
 
     agent_record = read_agent_identity(model_keeper, "performance-watch")
     agent_record["total_invocations"] += 1
 
     baselines = model_keeper.setdefault("flow_baselines", {})
-    SLOWDOWN_THRESHOLD = 1.25  # 25% slower than p50
+    SLOWDOWN_THRESHOLD = 1.25
 
-    slowdowns = []
-    updated_baselines = []
-    for r in sentinel_report.get("results", []):
+    slowdowns: list[dict] = []
+    updated_baselines: list[str] = []
+    for r in sentinel_det.get("results", []):
         if r.get("status") != "passed":
-            continue  # only measure passing flows
+            continue
         flow_name = r["flow_name"]
         duration = r["duration_ms"]
         base = baselines.get(flow_name)
         if base is None or base.get("n_observations", 0) == 0:
-            # First observation — seed baseline
             baselines[flow_name] = {
                 "p50_ms": duration,
                 "n_observations": 1,
@@ -512,13 +668,16 @@ def run_performance_watch(
         else:
             p50 = base["p50_ms"]
             if duration >= p50 * SLOWDOWN_THRESHOLD:
-                slowdowns.append({
-                    "flow_name": flow_name,
-                    "duration_ms": duration,
-                    "baseline_p50_ms": p50,
-                    "slowdown_pct": round((duration - p50) / p50 * 100, 1),
-                })
-            # Update rolling p50 (simple EMA)
+                slowdowns.append(
+                    {
+                        "flow_name": flow_name,
+                        "duration_ms": duration,
+                        "baseline_p50_ms": p50,
+                        "slowdown_pct": round(
+                            (duration - p50) / p50 * 100, 1
+                        ),
+                    }
+                )
             n = base["n_observations"]
             new_p50 = int(p50 * 0.8 + duration * 0.2)
             baselines[flow_name] = {
@@ -529,25 +688,25 @@ def run_performance_watch(
             updated_baselines.append(flow_name)
 
     if slowdowns:
-        verdict = "WARN"
+        det_verdict = "WARN"
         confidence = 0.85
         warnings_list = [
             f"{s['flow_name']}: {s['duration_ms']}ms vs baseline {s['baseline_p50_ms']}ms (+{s['slowdown_pct']}%)"
             for s in slowdowns
         ]
     elif not updated_baselines:
-        verdict = "PASS"
-        confidence = 0.0  # no signal
+        det_verdict = "PASS"
+        confidence = 0.0
         warnings_list = ["No passing flows to measure"]
     else:
-        verdict = "PASS"
+        det_verdict = "PASS"
         confidence = 0.9
         warnings_list = []
 
     report = {
         "agent": "performance-watch",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
             f"{len(updated_baselines)} flow(s) measured, {len(slowdowns)} slowdown(s) detected "
@@ -560,120 +719,214 @@ def run_performance_watch(
         "warnings": warnings_list,
         "generated_at": now_iso(),
     }
+
+    perf_agent = _make_agent("perf")
+    phase1 = perf_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "slowdowns": slowdowns,
+            "baselines_updated_count": len(updated_baselines),
+            "threshold_pct": int((SLOWDOWN_THRESHOLD - 1) * 100),
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     perf_path = run_dir / "performance-watch.json"
     perf_path.write_text(json.dumps(report, indent=2))
-    print(f"[perfwatch] verdict={verdict} confidence={confidence} (slowdowns={len(slowdowns)})", file=sys.stderr)
+    print(
+        f"[perfwatch] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
+        file=sys.stderr,
+    )
 
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": (warnings_list[0] if warnings_list else f"{len(updated_baselines)} baselines updated, no slowdowns"),
-    })
-    write_agent_identity(model_keeper, "performance-watch", agent_record)
-
-    return report
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "Performance Watch",
+    }
 
 
-# Regex patterns for the Security Scout — kept deliberately conservative
-# to minimize false positives in v2.
+# Regex patterns kept here for the security/a11y deterministic sensors.
 SECRET_PATTERNS = [
     (re.compile(r"(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"), "stripe-key"),
     (re.compile(r"sk-(?:proj-)?[A-Za-z0-9]{20,}"), "openai-key"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "aws-access-key-id"),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "github-personal-token"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "github-fine-grained-token"),
-    (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----"), "private-key-block"),
-    (re.compile(r"(?i)(?:password|passwd|pwd|api[_-]?key|api[_-]?secret|access[_-]?token)\s*[:=]\s*['\"][^'\"]{8,}['\"]"), "hardcoded-credential"),
+    (
+        re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+        "github-fine-grained-token",
+    ),
+    (
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----"),
+        "private-key-block",
+    ),
+    (
+        re.compile(
+            r"(?i)(?:password|passwd|pwd|api[_-]?key|api[_-]?secret|access[_-]?token)\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+        ),
+        "hardcoded-credential",
+    ),
 ]
 
 DANGEROUS_PATTERNS = [
-    (re.compile(r"\beval\s*\("), "eval-call", "Dynamic code execution — review for injection risk"),
-    (re.compile(r"new\s+Function\s*\("), "function-ctor", "Function constructor evaluates strings as code"),
-    (re.compile(r"child_process\.exec\s*\([^)]*\+"), "exec-string-concat", "Concatenated shell exec — command injection risk"),
-    (re.compile(r"dangerouslySetInnerHTML"), "dangerously-set-inner-html", "Bypasses React XSS protection — verify sanitization"),
-    (re.compile(r"document\.write\s*\("), "document-write", "document.write is XSS-prone"),
-    (re.compile(r"v-html\s*="), "vue-v-html", "Vue v-html bypasses XSS protection"),
+    (
+        re.compile(r"\beval\s*\("),
+        "eval-call",
+        "Dynamic code execution -- review for injection risk",
+    ),
+    (
+        re.compile(r"new\s+Function\s*\("),
+        "function-ctor",
+        "Function constructor evaluates strings as code",
+    ),
+    (
+        re.compile(r"child_process\.exec\s*\([^)]*\+"),
+        "exec-string-concat",
+        "Concatenated shell exec -- command injection risk",
+    ),
+    (
+        re.compile(r"dangerouslySetInnerHTML"),
+        "dangerously-set-inner-html",
+        "Bypasses React XSS protection -- verify sanitization",
+    ),
+    (
+        re.compile(r"document\.write\s*\("),
+        "document-write",
+        "document.write is XSS-prone",
+    ),
+    (
+        re.compile(r"v-html\s*="),
+        "vue-v-html",
+        "Vue v-html bypasses XSS protection",
+    ),
 ]
 
 A11Y_PATTERNS = [
-    (re.compile(r"<img\b(?![^>]*\balt\s*=)[^>]*/?>"), "img-no-alt", "<img> without alt attribute"),
-    (re.compile(r"<button\b(?![^>]*aria-label)[^>]*>\s*</button>"), "empty-button-no-label", "Empty <button> without aria-label"),
-    (re.compile(r"<input\b(?![^>]*\b(?:aria-label|aria-labelledby)\s*=)[^>]*/?>"), "input-no-aria-label", "<input> with no aria-label (verify <label htmlFor=...> elsewhere)"),
-    (re.compile(r"<div\b[^>]*\bonClick\s*="), "div-onclick-no-role", "<div onClick> without role=button or tabIndex"),
-    (re.compile(r"<a\b[^>]*href\s*=\s*[\"']#[\"']"), "anchor-href-hash", "<a href=\"#\"> is not a real link"),
-    (re.compile(r"tabIndex\s*=\s*[\"']?[1-9]"), "tabindex-positive", "Positive tabIndex creates unpredictable focus order"),
+    (
+        re.compile(r"<img\b(?![^>]*\balt\s*=)[^>]*/?>"),
+        "img-no-alt",
+        "<img> without alt attribute",
+    ),
+    (
+        re.compile(r"<button\b(?![^>]*aria-label)[^>]*>\s*</button>"),
+        "empty-button-no-label",
+        "Empty <button> without aria-label",
+    ),
+    (
+        re.compile(
+            r"<input\b(?![^>]*\b(?:aria-label|aria-labelledby)\s*=)[^>]*/?>"
+        ),
+        "input-no-aria-label",
+        "<input> with no aria-label (verify <label htmlFor=...> elsewhere)",
+    ),
+    (
+        re.compile(r"<div\b[^>]*\bonClick\s*="),
+        "div-onclick-no-role",
+        "<div onClick> without role=button or tabIndex",
+    ),
+    (
+        re.compile(r"<a\b[^>]*href\s*=\s*[\"']#[\"']"),
+        "anchor-href-hash",
+        '<a href="#"> is not a real link',
+    ),
+    (
+        re.compile(r"tabIndex\s*=\s*[\"']?[1-9]"),
+        "tabindex-positive",
+        "Positive tabIndex creates unpredictable focus order",
+    ),
 ]
 
 
 def run_security_scout(
-    diff_path: Path, run_dir: Path, model_keeper: dict,
+    diff_path: Path,
+    run_dir: Path,
+    model_keeper: dict,
 ) -> dict:
-    """Static security scan of the diff. Three checks:
-    1. Secret patterns in additions
-    2. package.json dependency changes (recommend manual audit)
-    3. Dangerous code patterns in additions
-    """
-    print("[security] Scanning diff for security concerns...", file=sys.stderr)
+    print(
+        "[security] Scanning diff for security concerns...",
+        file=sys.stderr,
+    )
 
     agent_record = read_agent_identity(model_keeper, "security-scout")
     agent_record["total_invocations"] += 1
 
     diff_text = diff_path.read_text()
-    additions = []  # lines that start with '+' but not '+++'
-    current_file = None
+    additions: list[tuple[str, str]] = []
+    current_file: str | None = None
     for line in diff_text.split("\n"):
         m_file = re.match(r"^\+\+\+ b/(.+)$", line)
         if m_file:
             current_file = m_file.group(1)
             continue
-        if line.startswith("+") and not line.startswith("+++") and current_file:
+        if (
+            line.startswith("+")
+            and not line.startswith("+++")
+            and current_file
+        ):
             additions.append((current_file, line[1:]))
 
-    secrets_found = []
-    dangerous_found = []
+    secrets_found: list[dict] = []
+    dangerous_found: list[dict] = []
     for file, line in additions:
         for pattern, label in SECRET_PATTERNS:
             if pattern.search(line):
-                secrets_found.append({"file": file, "label": label, "excerpt": line[:80]})
-                break  # one match per line is enough
+                secrets_found.append(
+                    {"file": file, "label": label, "excerpt": line[:80]}
+                )
+                break
         for pattern, label, desc in DANGEROUS_PATTERNS:
             if pattern.search(line):
-                dangerous_found.append({"file": file, "label": label, "description": desc, "excerpt": line[:80]})
+                dangerous_found.append(
+                    {
+                        "file": file,
+                        "label": label,
+                        "description": desc,
+                        "excerpt": line[:80],
+                    }
+                )
                 break
 
-    # Check if package.json (or yarn.lock / package-lock.json) changed
     dep_files_changed = [
-        line for line in diff_text.split("\n")
-        if re.match(r"^\+\+\+ b/.+(?:package\.json|yarn\.lock|package-lock\.json)$", line)
+        line
+        for line in diff_text.split("\n")
+        if re.match(
+            r"^\+\+\+ b/.+(?:package\.json|yarn\.lock|package-lock\.json)$",
+            line,
+        )
     ]
 
-    # Verdict logic
     if secrets_found:
-        verdict = "FAIL"
+        det_verdict = "FAIL"
         confidence = 0.9
     elif dangerous_found:
-        verdict = "WARN"
+        det_verdict = "WARN"
         confidence = 0.7
     elif dep_files_changed:
-        verdict = "WARN"
+        det_verdict = "WARN"
         confidence = 0.6
     else:
-        verdict = "PASS"
+        det_verdict = "PASS"
         confidence = 0.85
 
-    warnings_list = []
+    warnings_list: list[str] = []
     for s in secrets_found[:5]:
-        warnings_list.append(f"CRITICAL: secret pattern '{s['label']}' detected in {s['file']}")
+        warnings_list.append(
+            f"CRITICAL: secret pattern '{s['label']}' detected in {s['file']}"
+        )
     for d in dangerous_found[:5]:
-        warnings_list.append(f"{d['file']}: {d['label']} — {d['description']}")
+        warnings_list.append(
+            f"{d['file']}: {d['label']} -- {d['description']}"
+        )
     if dep_files_changed and not secrets_found and not dangerous_found:
-        warnings_list.append(f"Dependency file(s) changed — recommend running `npm audit` or `yarn audit` manually")
+        warnings_list.append(
+            "Dependency file(s) changed -- recommend running `npm audit` or `yarn audit` manually"
+        )
 
     report = {
         "agent": "security-scout",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
             f"secrets={len(secrets_found)}, dangerous_patterns={len(dangerous_found)}, "
@@ -684,403 +937,447 @@ def run_security_scout(
         "dependency_files_changed": dep_files_changed,
         "evidence": [str(diff_path)],
         "warnings": warnings_list,
-        "v3_followup": "Real SAST integration (CodeQL/Snyk) recommended for production use",
         "generated_at": now_iso(),
     }
+
+    sec_agent = _make_agent("security")
+    diff_sample_lines = [
+        line
+        for line in diff_text.split("\n")
+        if line.startswith("+") and not line.startswith("+++")
+    ][:50]
+    phase1 = sec_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "secrets_found": secrets_found,
+            "dangerous_patterns_found": dangerous_found,
+            "dependency_files_changed_count": len(dep_files_changed),
+            "diff_additions_sample": "\n".join(diff_sample_lines),
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     sec_path = run_dir / "security-scout.json"
     sec_path.write_text(json.dumps(report, indent=2))
-    print(f"[security] verdict={verdict} confidence={confidence}", file=sys.stderr)
-
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": (warnings_list[0] if warnings_list else "no security concerns found"),
-    })
-    write_agent_identity(model_keeper, "security-scout", agent_record)
-
-    # LLM beyond-regex (v3) — catch things regex missed
-    sec_llm = LLMAgent(
-        role_name="Security Scout",
-        role_prompt=(
-            "You are the Security Scout. Regex caught what regex catches. Your job is to look at "
-            "the diff additions for things regex CAN'T catch: subtle injection patterns, unsafe "
-            "deserialization, JWT misuse, weak crypto choices, broken authz flows. "
-            "If regex already found CRITICAL secrets, agree with FAIL. Otherwise, scan the additions "
-            "for nuanced concerns regex missed. Be specific — quote the line."
-        ),
-        model=HAIKU,
+    print(
+        f"[security] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
+        file=sys.stderr,
     )
-    det_data = {
-        "verdict": verdict,
-        "summary_line": (f"regex found: {len(secrets_found)} secrets, "
-                        f"{len(dangerous_found)} dangerous patterns, "
-                        f"{len(dep_files_changed)} dep file changes"),
-        "secrets_found": secrets_found,
-        "dangerous_found": dangerous_found,
-        "diff_additions_sample": "\n".join([line for line in diff_text.split("\n") if line.startswith("+") and not line.startswith("+++")][:50]),
-    }
-    sec_judgment = sec_llm.think(det_data, agent_record)
-    if sec_judgment.used_llm:
-        # Security can only ESCALATE, never de-escalate
-        rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
-        if rank.get(sec_judgment.verdict, 0) > rank.get(verdict, 0):
-            report["verdict"] = sec_judgment.verdict
-            report["confidence"] = min(report["confidence"], 0.85)
-        report["llm_narrative"] = sec_judgment.narrative
-        report["llm_recommendations"] = sec_judgment.recommendations
-    sec_path.write_text(json.dumps(report, indent=2))
 
-    return report
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "Security Scout",
+    }
 
 
 def run_accessibility_auditor(
-    diff_path: Path, run_dir: Path, model_keeper: dict,
+    diff_path: Path,
+    run_dir: Path,
+    model_keeper: dict,
 ) -> dict:
-    """Heuristic accessibility scan of diff additions.
-    v2 scaffold: catches common JSX/HTML anti-patterns.
-    v3 will integrate real axe-core via Playwright MCP."""
-    print("[a11y] Scanning diff for accessibility concerns...", file=sys.stderr)
+    print(
+        "[a11y] Scanning diff for accessibility concerns...", file=sys.stderr
+    )
 
     agent_record = read_agent_identity(model_keeper, "a11y-auditor")
     agent_record["total_invocations"] += 1
 
     diff_text = diff_path.read_text()
-    issues = []
-    current_file = None
+    issues: list[dict] = []
+    ui_addition_sample: list[str] = []
+    current_file: str | None = None
     for line in diff_text.split("\n"):
         m_file = re.match(r"^\+\+\+ b/(.+)$", line)
         if m_file:
             current_file = m_file.group(1)
             continue
-        if line.startswith("+") and not line.startswith("+++") and current_file:
-            # Only check files that look like UI code
-            if not re.search(r"\.(tsx|jsx|vue|html|svelte|astro)$", current_file):
+        if (
+            line.startswith("+")
+            and not line.startswith("+++")
+            and current_file
+        ):
+            if not re.search(
+                r"\.(tsx|jsx|vue|html|svelte|astro)$", current_file
+            ):
                 continue
             content = line[1:]
+            if len(ui_addition_sample) < 40:
+                ui_addition_sample.append(f"{current_file}: {content[:120]}")
             for pattern, label, desc in A11Y_PATTERNS:
                 if pattern.search(content):
-                    issues.append({
-                        "file": current_file,
-                        "label": label,
-                        "description": desc,
-                        "excerpt": content.strip()[:80],
-                    })
-                    break  # one issue per added line is enough
+                    issues.append(
+                        {
+                            "file": current_file,
+                            "label": label,
+                            "description": desc,
+                            "excerpt": content.strip()[:80],
+                        }
+                    )
+                    break
 
-    # Verdict logic — A11y is advisory; cap verdict at WARN even with many issues
     if issues:
-        verdict = "WARN"
+        det_verdict = "WARN"
         confidence = min(0.85, 0.5 + 0.05 * len(issues))
     else:
-        verdict = "PASS"
-        confidence = 0.7  # heuristic — cannot certify "no a11y issues exist"
+        det_verdict = "PASS"
+        confidence = 0.7
 
-    warnings_list = [f"{i['file']}: {i['label']} — {i['description']}" for i in issues[:10]]
+    warnings_list = [
+        f"{i['file']}: {i['label']} -- {i['description']}" for i in issues[:10]
+    ]
 
     report = {
         "agent": "a11y-auditor",
         "run_id": run_dir.name,
-        "verdict": verdict,
+        "verdict": det_verdict,
         "confidence": confidence,
         "confidence_reasoning": (
             f"heuristic_issues={len(issues)} found in UI-file additions; "
-            f"PASS confidence capped at 0.7 because heuristics cannot prove absence of all a11y bugs"
+            "PASS confidence capped at 0.7 because heuristics cannot prove absence of all a11y bugs"
         ),
-        "issues_found": issues[:50],  # cap to keep report small
+        "issues_found": issues[:50],
         "total_issues_found": len(issues),
-        "scope_note": "v2 scaffold uses regex heuristics on UI file diffs only. Real axe-core integration is v3.",
-        "v3_followup": "Integrate axe-core via Playwright MCP — drive real browser against running app, capture WCAG violations.",
         "evidence": [str(diff_path)],
         "warnings": warnings_list,
         "generated_at": now_iso(),
     }
+
+    a11y_agent = _make_agent("a11y")
+    phase1 = a11y_agent.investigate(
+        deterministic_data={
+            "deterministic_verdict": det_verdict,
+            "issues_found": issues[:30],
+            "total_issues_found": len(issues),
+            "ui_additions_sample": "\n".join(ui_addition_sample),
+        },
+        identity_record=agent_record,
+    )
+    report["verdict"] = phase1.verdict
+    report["llm_phase1"] = _llm_result_to_dict(phase1)
+
     a11y_path = run_dir / "a11y-auditor.json"
     a11y_path.write_text(json.dumps(report, indent=2))
-    print(f"[a11y] verdict={verdict} confidence={confidence:.2f} (issues={len(issues)})", file=sys.stderr)
+    print(
+        f"[a11y] phase1 verdict={phase1.verdict} -- {phase1.narrative[:120]}",
+        file=sys.stderr,
+    )
 
-    agent_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict,
-        "confidence": confidence,
-        "key_observation": (warnings_list[0] if warnings_list else "no heuristic a11y issues found"),
-    })
-    write_agent_identity(model_keeper, "a11y-auditor", agent_record)
-
-    return report
+    return {
+        "deterministic": report,
+        "phase1": phase1,
+        "agent_role": "A11y Auditor",
+    }
 
 
-def synthesize_verdict(
-    auditor: dict, sentinel: dict, contract: dict, run_dir: Path, model_keeper: dict,
-    perf: dict | None = None, security: dict | None = None, a11y: dict | None = None,
+# ---------------------------------------------------------------------------
+# Phase 2 — Team review
+# ---------------------------------------------------------------------------
+
+
+def run_team_review(
+    role_key: str,
+    phase1: dict,
+    model_keeper: dict,
+    run_dir: Path,
 ) -> dict:
-    """QA Lead — combine auditor + sentinel + contract into final verdict."""
-    print("[qa-lead] Synthesizing verdict...", file=sys.stderr)
+    role_name, identity_key, model, prompt = AGENT_ROLES[role_key]
+    print(
+        f"[team-review] {role_name} reviewing team findings...",
+        file=sys.stderr,
+    )
 
-    verdicts = {
-        "auditor": auditor["verdict"],
-        "sentinel": sentinel["verdict"],
-        "contract": contract["verdict"],
+    agent = LLMAgent(role_name=role_name, role_prompt=prompt, model=model)
+    agent_record = read_agent_identity(model_keeper, identity_key)
+
+    my_p1: LLMResult = phase1[role_key]["phase1"]
+    team_findings: dict[str, LLMResult] = {
+        AGENT_ROLES[k][0]: phase1[k]["phase1"] for k in phase1
     }
-    confidences = {
-        "auditor": auditor["confidence"],
-        "sentinel": sentinel["confidence"],
-        "contract": contract["confidence"],
+
+    review = agent.team_review(my_p1, team_findings, agent_record)
+
+    review_path = run_dir / f"{role_key}-review.json"
+    review_path.write_text(
+        json.dumps(
+            {
+                "agent_role": role_name,
+                "phase2_verdict": review.verdict,
+                "phase2_narrative": review.narrative,
+                "phase2_recommendations": review.recommendations,
+                "phase2_confidence_basis": review.confidence_basis,
+            },
+            indent=2,
+        )
+    )
+
+    # Update agent identity with FINAL (phase-2) finding
+    agent_record["recent_findings"].append(
+        {
+            "run_id": run_dir.name,
+            "verdict": review.verdict,
+            "confidence": None,
+            "key_observation": review.narrative[:200],
+        }
+    )
+    write_agent_identity(model_keeper, identity_key, agent_record)
+
+    print(
+        f"[team-review] {role_name} -> {review.verdict}: {review.narrative[:120]}",
+        file=sys.stderr,
+    )
+    return {"phase2": review, "role_name": role_name}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — QA Lead synthesis
+# ---------------------------------------------------------------------------
+
+
+def synthesize_verdict_v3(
+    phase1: dict,
+    phase2: dict,
+    run_dir: Path,
+    model_keeper: dict,
+) -> dict:
+    print("[qa-lead] Synthesizing team verdict...", file=sys.stderr)
+
+    final_verdicts = {
+        role: phase2[role]["phase2"].verdict for role in phase2
     }
-
-    # All 3 agree?
-    unique_verdicts = set(verdicts.values())
-    full_agreement = len(unique_verdicts) == 1
-
     rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
-    final_v = max(verdicts.values(), key=lambda v: rank[v])
-    agreement_factor = 1.0 if full_agreement else 0.6
-    final_confidence = round(min(confidences.values()) * agreement_factor, 2)
+    final_v = max(final_verdicts.values(), key=lambda v: rank[v])
+    full_agreement = len(set(final_verdicts.values())) == 1
 
-    disagreement_reason = None
-    if not full_agreement:
-        parts = [f"{name}={v} ({int(confidences[name]*100)}%)" for name, v in verdicts.items()]
-        disagreement_reason = "Disagreement across agents: " + ", ".join(parts)
-
-    perf_signal = None
-    if perf:
-        perf_signal = {"verdict": perf["verdict"], "confidence": perf["confidence"]}
-        if perf["verdict"] in ("WARN", "FAIL") and final_v == "PASS":
-            final_v = "WARN"
-            disagreement_reason = (disagreement_reason or "") + (
-                " | Performance Watch flagged slowdown — see performance-watch.json"
-            )
-
-    security_signal = None
-    if security:
-        security_signal = {"verdict": security["verdict"], "confidence": security["confidence"]}
-        if security["verdict"] == "FAIL":
-            final_v = "FAIL"  # security FAIL always wins
-            disagreement_reason = (disagreement_reason or "") + (
-                " | Security Scout FAILED — see security-scout.json"
-            )
-        elif security["verdict"] == "WARN" and final_v == "PASS":
-            final_v = "WARN"
-            disagreement_reason = (disagreement_reason or "") + (
-                " | Security Scout flagged a concern"
-            )
-
-    a11y_signal = None
-    if a11y:
-        a11y_signal = {"verdict": a11y["verdict"], "confidence": a11y["confidence"]}
-        if a11y["verdict"] == "WARN" and final_v == "PASS":
-            final_v = "WARN"
-            disagreement_reason = (disagreement_reason or "") + (
-                " | Accessibility Auditor flagged issues (heuristic — may be false positives)"
-            )
-
-    result = {
-        "run_id": run_dir.name,
-        "final_verdict": final_v,
-        "final_confidence": final_confidence,
-        "agreement": full_agreement,
-        "disagreement_reason": disagreement_reason,
-        "auditor": {"verdict": auditor["verdict"], "confidence": auditor["confidence"]},
-        "sentinel": {"verdict": sentinel["verdict"], "confidence": sentinel["confidence"]},
-        "contract": {"verdict": contract["verdict"], "confidence": contract["confidence"]},
-        "generated_at": now_iso(),
-    }
-    if perf_signal:
-        result["perf"] = perf_signal
-    if security_signal:
-        result["security"] = security_signal
-    if a11y_signal:
-        result["a11y"] = a11y_signal
-
-    # LLM reasoning layer for QA Lead (v3)
-    qa_llm = LLMAgent(
+    qa_agent = LLMAgent(
         role_name="QA Lead",
         role_prompt=(
-            "You are the QA Lead synthesizing 6 specialist agents' findings into one verdict. "
-            "When agents agree, validate the verdict with a brief summary. "
-            "When agents disagree, IDENTIFY which disagreement is the most signal-rich "
-            "and explain WHY they might disagree — is it a false positive, a real surfaced issue, "
-            "or a complementary view? Be concise and actionable."
+            "You are the QA Lead synthesizing 6 specialist agents' two-phase findings. "
+            "Phase 1 was independent investigation; Phase 2 was team review. "
+            "Your job: produce a final synthesis that explains WHAT THE TEAM CONCLUDED. "
+            "Reference specific agents by role. If they disagreed in phase 1 and converged "
+            "in phase 2, explain HOW the team converged. If disagreement persists, identify "
+            "the most signal-rich one."
         ),
         model=SONNET,
     )
     qa_record = read_agent_identity(model_keeper, "qa-lead")
-    det_data = {
-        "verdict": final_v,
-        "confidence": final_confidence,
-        "agreement": full_agreement,
-        "summary_line": f"final={final_v} @ {int(final_confidence*100)}%, agreement={full_agreement}",
-        "all_verdicts": verdicts,
-        "all_confidences": confidences,
-        "disagreement_detail": disagreement_reason,
-    }
-    qa_judgment = qa_llm.think(det_data, qa_record)
-    if qa_judgment.used_llm:
-        result["llm_synthesis"] = qa_judgment.narrative
-        result["llm_recommendations"] = qa_judgment.recommendations
+    qa_record["total_invocations"] += 1
 
+    team_summary_for_qa = {
+        role: {
+            "phase1": {
+                "verdict": phase1[role]["phase1"].verdict,
+                "narrative": phase1[role]["phase1"].narrative,
+            },
+            "phase2": {
+                "verdict": phase2[role]["phase2"].verdict,
+                "narrative": phase2[role]["phase2"].narrative,
+            },
+        }
+        for role in phase1
+    }
+
+    qa_result = qa_agent.investigate(
+        deterministic_data={
+            "deterministic_final_verdict": final_v,
+            "final_verdicts": final_verdicts,
+            "full_agreement": full_agreement,
+            "team_two_phase_summary": team_summary_for_qa,
+        },
+        identity_record=qa_record,
+    )
+
+    qa_record["recent_findings"].append(
+        {
+            "run_id": run_dir.name,
+            "verdict": qa_result.verdict,
+            "confidence": None,
+            "key_observation": qa_result.narrative[:200],
+        }
+    )
+    write_agent_identity(model_keeper, "qa-lead", qa_record)
+
+    # QA Lead can stand by, escalate, or de-escalate — but final must be at least max(team)
+    if rank.get(qa_result.verdict, 0) < rank[final_v]:
+        # Don't allow QA to de-escalate below the team max — surface that
+        final_verdict = final_v
+    else:
+        final_verdict = qa_result.verdict
+
+    print(
+        f"[qa-lead] {qa_result.verdict} (team_max={final_v}) -- "
+        f"{qa_result.narrative[:180]}",
+        file=sys.stderr,
+    )
+
+    result = {
+        "run_id": run_dir.name,
+        "final_verdict": final_verdict,
+        "qa_lead_phase3_verdict": qa_result.verdict,
+        "team_max_verdict": final_v,
+        "qa_lead_synthesis": qa_result.narrative,
+        "qa_lead_recommendations": qa_result.recommendations,
+        "qa_lead_confidence_basis": qa_result.confidence_basis,
+        "agreement": full_agreement,
+        "phase1_verdicts": {
+            role: phase1[role]["phase1"].verdict for role in phase1
+        },
+        "phase2_verdicts": final_verdicts,
+        "generated_at": now_iso(),
+    }
+    (run_dir / "verdict.json").write_text(json.dumps(result, indent=2))
     return result
 
 
-def write_verdict_md(
-    verdict: dict, auditor: dict, sentinel: dict, run_dir: Path, target: str,
-    contract: dict | None = None, perf: dict | None = None,
-    security: dict | None = None, a11y: dict | None = None,
-):
-    md_path = run_dir / "verdict.md"
-    lines = []
-    lines.append(f"# EGV Verification Report — {target}")
+# ---------------------------------------------------------------------------
+# Verdict markdown rendering
+# ---------------------------------------------------------------------------
+
+
+def write_verdict_md_v3(
+    verdict: dict,
+    phase1: dict,
+    phase2: dict,
+    run_dir: Path,
+    target: str,
+) -> None:
+    lines: list[str] = []
+    lines.append(f"# EGV Team Verdict -- {target}")
     lines.append("")
     lines.append(f"Run ID: `{verdict['run_id']}`")
     lines.append(f"Generated: {verdict['generated_at']}")
     lines.append("")
-    lines.append(f"## Final Verdict: **{verdict['final_verdict']}** (confidence: {int(verdict['final_confidence']*100)}%)")
+    lines.append(f"## Final: **{verdict['final_verdict']}**")
     lines.append("")
-    if not verdict["agreement"]:
-        lines.append(f"### DISAGREEMENT detected (EGV Principle 5)")
-        lines.append(f"{verdict['disagreement_reason']}")
-        lines.append("")
-    lines.append("## Team verdicts")
+    lines.append(f"Agreement across team: {'YES' if verdict['agreement'] else 'NO'}")
     lines.append("")
-    lines.append(f"| Agent | Verdict | Confidence |")
-    lines.append(f"|-------|---------|-----------|")
-    lines.append(f"| 💥 Regression Auditor | {auditor['verdict']} | {int(auditor['confidence']*100)}% |")
-    lines.append(f"| 🛡️ Critical Path Sentinel | {sentinel['verdict']} | {int(sentinel['confidence']*100)}% |")
-    if contract:
-        lines.append(f"| 🔒 Contract Sentinel | {contract['verdict']} | {int(contract['confidence']*100)}% |")
-    if perf:
-        lines.append(f"| ⚡ Performance Watch | {perf['verdict']} | {int(perf['confidence']*100)}% |")
-    if security:
-        lines.append(f"| 🔐 Security Scout | {security['verdict']} | {int(security['confidence']*100)}% |")
-    if a11y:
-        lines.append(f"| ♿ A11y Auditor | {a11y['verdict']} | {int(a11y['confidence']*100)}% |")
+    lines.append("## QA Lead synthesis")
     lines.append("")
-    lines.append("## Blast radius (Regression Auditor)")
-    br = auditor["blast_radius"]
-    lines.append(f"- Production code changed: **{br['production_changed_lines']} lines**")
-    lines.append(f"- Test code changed: {br['test_changed_lines']} lines (excluded from risk)")
-    lines.append(f"- Covered by existing tests: **{br['covered_changed_lines']}** of {br['production_changed_lines']} production lines")
-    lines.append(f"- Uncovered production lines: **{br['uncovered_changed_lines']}** (risk)")
+    lines.append(verdict["qa_lead_synthesis"])
+    if verdict.get("qa_lead_recommendations"):
+        lines.append("")
+        lines.append("### Recommendations")
+        for r in verdict["qa_lead_recommendations"]:
+            lines.append(f"- {r}")
     lines.append("")
-    if auditor.get("warnings"):
-        lines.append("### Warnings")
-        for w in auditor["warnings"]:
-            lines.append(f"- {w}")
-        lines.append("")
-    lines.append("### Per-file classification")
+    lines.append("## Team conversation")
     lines.append("")
-    lines.append("| File | Status | Uncovered |")
-    lines.append("|------|--------|-----------|")
-    for f in br["files"]:
-        lines.append(f"| `{f['file']}` | {f['status']} | {f['uncovered_line_count']} |")
-    lines.append("")
-    lines.append("## Critical Path Sentinel results")
-    lines.append("")
-    lines.append("| Flow | Status | Duration | Evidence |")
-    lines.append("|------|--------|----------|----------|")
-    for r in sentinel["results"]:
-        ev = f"`{Path(r['evidence_path']).name}`" if r["evidence_path"] else "—"
-        lines.append(f"| {r['flow_name']} | {r['status']} | {r['duration_ms']}ms | {ev} |")
-    lines.append("")
-    # Contract Sentinel detail (if present)
-    if contract and contract.get("warnings"):
-        lines.append("## Contract Sentinel warnings")
+    for role_key in ("auditor", "sentinel", "contract", "perf", "security", "a11y"):
+        if role_key not in phase1:
+            continue
+        role_name = AGENT_ROLES[role_key][0]
+        p1: LLMResult = phase1[role_key]["phase1"]
+        p2: LLMResult = phase2[role_key]["phase2"]
+        lines.append(f"### {role_name}")
         lines.append("")
-        for w in contract["warnings"][:10]:
-            lines.append(f"- {w}")
+        lines.append(f"**Phase 1 (independent):** `{p1.verdict}`")
         lines.append("")
-    # Performance Watch detail (if present)
-    if perf and perf.get("slowdowns"):
-        lines.append("## Performance Watch — slowdowns detected")
+        lines.append(f"> {p1.narrative}")
         lines.append("")
-        lines.append("| Flow | Current | Baseline | Slowdown |")
-        lines.append("|------|---------|----------|----------|")
-        for s in perf["slowdowns"]:
-            lines.append(f"| {s['flow_name']} | {s['duration_ms']}ms | {s['baseline_p50_ms']}ms | +{s['slowdown_pct']}% |")
+        if p1.recommendations:
+            for r in p1.recommendations:
+                lines.append(f"- {r}")
+            lines.append("")
+        lines.append(f"**Phase 2 (after team review):** `{p2.verdict}`")
         lines.append("")
-    # Security Scout detail (if present)
-    if security and security.get("warnings"):
-        lines.append("## Security Scout findings")
+        lines.append(f"> {p2.narrative}")
         lines.append("")
-        for w in security["warnings"][:10]:
-            lines.append(f"- {w}")
-        lines.append("")
-    # A11y Auditor detail (if present)
-    if a11y and a11y.get("warnings"):
-        lines.append("## A11y Auditor findings")
-        lines.append("")
-        for w in a11y["warnings"][:10]:
-            lines.append(f"- {w}")
-        lines.append("")
-    lines.append("## EGV Principle Audit")
-    lines.append("")
-    lines.append("| # | Principle | Enacted? |")
-    lines.append("|---|-----------|----------|")
-    lines.append("| 1 | Skeptical Default | yes — every claim points to evidence file |")
-    lines.append("| 2 | Persistent External Mind | yes — Model Keeper read, run_history updated |")
-    lines.append("| 3 | Blast Radius First | yes — coverage × diff computed before any verification |")
-    lines.append("| 4 | Evidence Over Verdict | yes — all conclusions cite a JSON or .log file |")
-    lines.append("| 5 | Disagreement Is Signal | " + ("yes — disagreement detected and escalated" if not verdict["agreement"] else "yes — all agents agreed") + " |")
-    lines.append("| 6 | Calibrated Uncertainty | yes — confidence shown with derivation; capped at 0.95 |")
-    lines.append("| 7 | Accumulated Learning | yes — Model Keeper grows: agent identities, baselines, learned_patterns, lifecycle_artifacts |")
-
+        if p2.recommendations:
+            for r in p2.recommendations:
+                lines.append(f"- {r}")
+            lines.append("")
+    md_path = run_dir / "verdict.md"
     md_path.write_text("\n".join(lines))
     print(f"[qa-lead] verdict.md written to {md_path}", file=sys.stderr)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("target", help="Commit SHA or path to a diff file")
     parser.add_argument("--project", default="excalidraw")
-    parser.add_argument("--project-root", default=None,
-                       help="Path to the target project. v1 keeper lives at <project-root>/.egv/project-keeper.json")
-    parser.add_argument("--selected-flows", default=None,
-                       help="Comma-separated flow names to run (default: all)")
-    parser.add_argument("--enable-layer2", action="store_true",
-                       help="Enable Layer 2 E2E synthesis stub generation for uncovered production lines")
+    parser.add_argument("--project-root", default=None)
+    parser.add_argument("--selected-flows", default=None)
+    parser.add_argument("--enable-layer2", action="store_true")
     args = parser.parse_args()
+
+    # Verify API key BEFORE doing any work
+    try:
+        require_api_key()
+    except LLMUnavailableError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     if args.project_root:
         project_root_arg = Path(args.project_root).resolve()
         keeper_path = keeper_path_for_project_root(project_root_arg)
         if not keeper_path.exists():
-            print(f"FATAL: keeper not found at {keeper_path}", file=sys.stderr)
-            print(f"Run `python3 lib/onboard-project.py {project_root_arg}` first (v2 feature), or create the keeper manually.", file=sys.stderr)
+            print(
+                f"FATAL: keeper not found at {keeper_path}", file=sys.stderr
+            )
+            print(
+                f"Run `python3 lib/onboard-project.py {project_root_arg}` first, "
+                "or create the keeper manually.",
+                file=sys.stderr,
+            )
             sys.exit(2)
     else:
-        # Legacy discovery — emit deprecation warning
-        legacy_path = SKILL_ROOT / "model-keeper" / "projects" / f"{args.project}.json"
+        legacy_path = (
+            SKILL_ROOT / "model-keeper" / "projects" / f"{args.project}.json"
+        )
         if legacy_path.exists():
-            print(f"[WARN] Using legacy keeper path: {legacy_path}. v1: pass --project-root instead.", file=sys.stderr)
+            print(
+                f"[WARN] Using legacy keeper path: {legacy_path}. "
+                "Pass --project-root instead.",
+                file=sys.stderr,
+            )
             keeper_path = legacy_path
         else:
-            # Try v1 path inferred from project name (assumes ./poc/<project>)
             inferred_root = SKILL_ROOT.parent / args.project
             keeper_path = keeper_path_for_project_root(inferred_root)
             if not keeper_path.exists():
-                print(f"FATAL: no keeper found. Tried legacy ({legacy_path}) and v1 inferred ({keeper_path}).", file=sys.stderr)
-                print(f"Pass --project-root explicitly.", file=sys.stderr)
+                print(
+                    f"FATAL: no keeper found. Tried legacy ({legacy_path}) "
+                    f"and v1 inferred ({keeper_path}). Pass --project-root explicitly.",
+                    file=sys.stderr,
+                )
                 sys.exit(2)
 
     model_keeper = load_model_keeper(keeper_path)
 
-    # Surface any pending Layer 2 proposals (v2 gate enforcement)
     pending_proposals = [
-        p for p in model_keeper.get("lifecycle_artifacts", {}).get("synthesis_proposals", [])
+        p
+        for p in model_keeper.get("lifecycle_artifacts", {}).get(
+            "synthesis_proposals", []
+        )
         if not p.get("human_reviewed", False)
     ]
     if pending_proposals:
         print(
-            f"[orchestrator] WARNING: {len(pending_proposals)} unreviewed Layer 2 proposal(s) "
-            f"in Model Keeper. Review them via `python3 lib/egv_cli.py layer2-review`.",
+            f"[orchestrator] WARNING: {len(pending_proposals)} unreviewed Layer 2 proposal(s) in keeper.",
             file=sys.stderr,
         )
 
     project_root = Path(model_keeper["project_root"])
-    coverage_path = project_root / model_keeper["framework_config"]["coverage_output_path"]
+    coverage_path = (
+        project_root / model_keeper["framework_config"]["coverage_output_path"]
+    )
     if not coverage_path.exists():
-        print(f"FATAL: coverage file not found at {coverage_path}", file=sys.stderr)
-        print(f"Run `yarn test:coverage --run` in {project_root} first.", file=sys.stderr)
+        print(
+            f"FATAL: coverage file not found at {coverage_path}",
+            file=sys.stderr,
+        )
+        print(
+            f"Run `yarn test:coverage --run` in {project_root} first.",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     run_id = make_run_id(args.target)
@@ -1089,56 +1386,79 @@ def main():
     print(f"[orchestrator] run_id={run_id}", file=sys.stderr)
 
     diff_path = get_diff(args.target, project_root)
-
     selected = args.selected_flows.split(",") if args.selected_flows else None
-    auditor = run_regression_auditor(diff_path, coverage_path, project_root, run_dir, model_keeper)
+
+    # ------------- Phase 1 -------------
+    print(
+        "[team] === PHASE 1: Independent investigation ===", file=sys.stderr
+    )
+    phase1: dict[str, dict] = {}
+    phase1["auditor"] = run_regression_auditor(
+        diff_path, coverage_path, project_root, run_dir, model_keeper
+    )
     if args.enable_layer2:
         from layer2 import synthesize_proposals
+
         layer2_result = synthesize_proposals(
             project_root, run_dir / "blast-radius.json"
         )
-        print(f"[layer2] Generated {layer2_result['proposals_generated']} stub proposal(s)", file=sys.stderr)
-        # Re-load keeper since layer2 saved it
+        print(
+            f"[layer2] Generated {layer2_result['proposals_generated']} stub proposal(s)",
+            file=sys.stderr,
+        )
         model_keeper = load_model_keeper(keeper_path)
-    sentinel = run_critical_path_sentinel(model_keeper, project_root, run_dir,
-                                          selected_flows=selected)
-    perf = run_performance_watch(sentinel, run_dir, model_keeper)
-    contract = run_contract_sentinel(diff_path, project_root, run_dir, model_keeper)
-    security = run_security_scout(diff_path, run_dir, model_keeper)
-    a11y = run_accessibility_auditor(diff_path, run_dir, model_keeper)
-    verdict = synthesize_verdict(auditor, sentinel, contract, run_dir, model_keeper,
-                                 perf=perf, security=security, a11y=a11y)
-    (run_dir / "verdict.json").write_text(json.dumps(verdict, indent=2))
-    write_verdict_md(
-        verdict, auditor, sentinel, run_dir, args.target,
-        contract=contract, perf=perf, security=security, a11y=a11y,
+
+    phase1["sentinel"] = run_critical_path_sentinel(
+        model_keeper, project_root, run_dir, selected_flows=selected
+    )
+    phase1["contract"] = run_contract_sentinel(
+        diff_path, project_root, run_dir, model_keeper
+    )
+    phase1["perf"] = run_performance_watch(
+        phase1["sentinel"]["deterministic"], run_dir, model_keeper
+    )
+    phase1["security"] = run_security_scout(diff_path, run_dir, model_keeper)
+    phase1["a11y"] = run_accessibility_auditor(
+        diff_path, run_dir, model_keeper
     )
 
-    qa_record = read_agent_identity(model_keeper, "qa-lead")
-    qa_record["total_invocations"] += 1
-    qa_record["recent_findings"].append({
-        "run_id": run_dir.name,
-        "verdict": verdict["final_verdict"],
-        "confidence": verdict["final_confidence"],
-        "key_observation": (
-            "agreement" if verdict["agreement"] else f"disagreement: {verdict['disagreement_reason']}"
-        ),
-    })
-    write_agent_identity(model_keeper, "qa-lead", qa_record)
+    # ------------- Phase 2 -------------
+    print("[team] === PHASE 2: Team review ===", file=sys.stderr)
+    phase2: dict[str, dict] = {}
+    for role_key in (
+        "auditor",
+        "sentinel",
+        "contract",
+        "perf",
+        "security",
+        "a11y",
+    ):
+        phase2[role_key] = run_team_review(
+            role_key, phase1, model_keeper, run_dir
+        )
+
+    # ------------- Phase 3 -------------
+    print("[team] === PHASE 3: QA Lead synthesis ===", file=sys.stderr)
+    verdict = synthesize_verdict_v3(phase1, phase2, run_dir, model_keeper)
+    write_verdict_md_v3(verdict, phase1, phase2, run_dir, args.target)
 
     save_model_keeper(keeper_path, model_keeper)
-    print(f"[orchestrator] Model Keeper updated at {keeper_path}", file=sys.stderr)
+    print(
+        f"[orchestrator] Model Keeper updated at {keeper_path}",
+        file=sys.stderr,
+    )
 
-    print(f"\n=== EGV Verification ===")
+    print("\n=== EGV Team Verdict ===")
     print(f"Target: {args.target}")
-    print(f"Final: {verdict['final_verdict']}  (confidence: {int(verdict['final_confidence']*100)}%)")
-    print(f"  Auditor:  {auditor['verdict']} ({int(auditor['confidence']*100)}%)")
-    print(f"  Sentinel: {sentinel['verdict']} ({int(sentinel['confidence']*100)}%)")
-    print(f"  Contract: {contract['verdict']} ({int(contract['confidence']*100)}%)")
-    print(f"  Perf:     {perf['verdict']} ({int(perf['confidence']*100)}%)")
-    print(f"  Security: {security['verdict']} ({int(security['confidence']*100)}%)")
-    print(f"  A11y:     {a11y['verdict']} ({int(a11y['confidence']*100)}%)")
-    print(f"  Agreement: {'YES' if verdict['agreement'] else 'NO — see disagreement_reason'}")
+    print(f"Final: {verdict['final_verdict']}")
+    print(f"Agreement: {'YES' if verdict['agreement'] else 'NO'}")
+    print("\nPhase 1 (independent):")
+    for role, v in verdict["phase1_verdicts"].items():
+        print(f"  {role}: {v}")
+    print("\nPhase 2 (after team review):")
+    for role, v in verdict["phase2_verdicts"].items():
+        print(f"  {role}: {v}")
+    print(f"\nQA Lead synthesis: {verdict['qa_lead_synthesis'][:300]}")
     print(f"\nReport: {run_dir / 'verdict.md'}")
 
 
