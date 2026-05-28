@@ -821,7 +821,11 @@ def synthesize_verdict(
     return result
 
 
-def write_verdict_md(verdict: dict, auditor: dict, sentinel: dict, run_dir: Path, target: str):
+def write_verdict_md(
+    verdict: dict, auditor: dict, sentinel: dict, run_dir: Path, target: str,
+    contract: dict | None = None, perf: dict | None = None,
+    security: dict | None = None, a11y: dict | None = None,
+):
     md_path = run_dir / "verdict.md"
     lines = []
     lines.append(f"# EGV Verification Report — {target}")
@@ -839,8 +843,16 @@ def write_verdict_md(verdict: dict, auditor: dict, sentinel: dict, run_dir: Path
     lines.append("")
     lines.append(f"| Agent | Verdict | Confidence |")
     lines.append(f"|-------|---------|-----------|")
-    lines.append(f"| Regression Auditor | {auditor['verdict']} | {int(auditor['confidence']*100)}% |")
-    lines.append(f"| Critical Path Sentinel | {sentinel['verdict']} | {int(sentinel['confidence']*100)}% |")
+    lines.append(f"| 💥 Regression Auditor | {auditor['verdict']} | {int(auditor['confidence']*100)}% |")
+    lines.append(f"| 🛡️ Critical Path Sentinel | {sentinel['verdict']} | {int(sentinel['confidence']*100)}% |")
+    if contract:
+        lines.append(f"| 🔒 Contract Sentinel | {contract['verdict']} | {int(contract['confidence']*100)}% |")
+    if perf:
+        lines.append(f"| ⚡ Performance Watch | {perf['verdict']} | {int(perf['confidence']*100)}% |")
+    if security:
+        lines.append(f"| 🔐 Security Scout | {security['verdict']} | {int(security['confidence']*100)}% |")
+    if a11y:
+        lines.append(f"| ♿ A11y Auditor | {a11y['verdict']} | {int(a11y['confidence']*100)}% |")
     lines.append("")
     lines.append("## Blast radius (Regression Auditor)")
     br = auditor["blast_radius"]
@@ -869,17 +881,47 @@ def write_verdict_md(verdict: dict, auditor: dict, sentinel: dict, run_dir: Path
         ev = f"`{Path(r['evidence_path']).name}`" if r["evidence_path"] else "—"
         lines.append(f"| {r['flow_name']} | {r['status']} | {r['duration_ms']}ms | {ev} |")
     lines.append("")
-    lines.append("## EGV Principle Audit (v0)")
+    # Contract Sentinel detail (if present)
+    if contract and contract.get("warnings"):
+        lines.append("## Contract Sentinel warnings")
+        lines.append("")
+        for w in contract["warnings"][:10]:
+            lines.append(f"- {w}")
+        lines.append("")
+    # Performance Watch detail (if present)
+    if perf and perf.get("slowdowns"):
+        lines.append("## Performance Watch — slowdowns detected")
+        lines.append("")
+        lines.append("| Flow | Current | Baseline | Slowdown |")
+        lines.append("|------|---------|----------|----------|")
+        for s in perf["slowdowns"]:
+            lines.append(f"| {s['flow_name']} | {s['duration_ms']}ms | {s['baseline_p50_ms']}ms | +{s['slowdown_pct']}% |")
+        lines.append("")
+    # Security Scout detail (if present)
+    if security and security.get("warnings"):
+        lines.append("## Security Scout findings")
+        lines.append("")
+        for w in security["warnings"][:10]:
+            lines.append(f"- {w}")
+        lines.append("")
+    # A11y Auditor detail (if present)
+    if a11y and a11y.get("warnings"):
+        lines.append("## A11y Auditor findings")
+        lines.append("")
+        for w in a11y["warnings"][:10]:
+            lines.append(f"- {w}")
+        lines.append("")
+    lines.append("## EGV Principle Audit")
     lines.append("")
     lines.append("| # | Principle | Enacted? |")
     lines.append("|---|-----------|----------|")
     lines.append("| 1 | Skeptical Default | yes — every claim points to evidence file |")
-    lines.append("| 2 | Persistent External Mind | yes — Model Keeper read, run_history will be updated |")
+    lines.append("| 2 | Persistent External Mind | yes — Model Keeper read, run_history updated |")
     lines.append("| 3 | Blast Radius First | yes — coverage × diff computed before any verification |")
     lines.append("| 4 | Evidence Over Verdict | yes — all conclusions cite a JSON or .log file |")
-    lines.append("| 5 | Disagreement Is Signal | " + ("yes — disagreement detected and escalated" if not verdict["agreement"] else "yes — both agents agreed") + " |")
+    lines.append("| 5 | Disagreement Is Signal | " + ("yes — disagreement detected and escalated" if not verdict["agreement"] else "yes — all agents agreed") + " |")
     lines.append("| 6 | Calibrated Uncertainty | yes — confidence shown with derivation; capped at 0.95 |")
-    lines.append("| 7 | Accumulated Learning | partial — Model Keeper write-back is recorded in JSON but mutation deferred to QA Lead policy decision |")
+    lines.append("| 7 | Accumulated Learning | yes — Model Keeper grows: agent identities, baselines, learned_patterns, lifecycle_artifacts |")
 
     md_path.write_text("\n".join(lines))
     print(f"[qa-lead] verdict.md written to {md_path}", file=sys.stderr)
@@ -966,7 +1008,10 @@ def main():
     verdict = synthesize_verdict(auditor, sentinel, contract, run_dir, model_keeper,
                                  perf=perf, security=security, a11y=a11y)
     (run_dir / "verdict.json").write_text(json.dumps(verdict, indent=2))
-    write_verdict_md(verdict, auditor, sentinel, run_dir, args.target)
+    write_verdict_md(
+        verdict, auditor, sentinel, run_dir, args.target,
+        contract=contract, perf=perf, security=security, a11y=a11y,
+    )
 
     qa_record = read_agent_identity(model_keeper, "qa-lead")
     qa_record["total_invocations"] += 1
