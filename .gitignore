@@ -1,0 +1,9 @@
+# Runtime artifacts
+reports/
+__pycache__/
+*.pyc
+.DS_Store
+*.v0.bak
+
+# Local-only deployment cache (the install target)
+~/.claude/

@@ -1,0 +1,944 @@
+{
+  "$schema": "../SCHEMA.md",
+  "project_name": "excalidraw",
+  "project_root": "/Users/weizhanhao/fortest/poc/excalidraw",
+  "framework": "vitest+playwright",
+  "framework_config": {
+    "test_runner": "vitest",
+    "coverage_command": "yarn test:coverage --run --reporter=json",
+    "coverage_output_path": "coverage/coverage-final.json",
+    "typecheck_command": "yarn test:typecheck",
+    "test_file_pattern": "**/*.test.{ts,tsx}",
+    "sentinel_test_command": "yarn test:app --run {test_path}"
+  },
+  "critical_flows": [
+    {
+      "name": "draw-shape-via-drag",
+      "description": "User drags on canvas to create rectangle/ellipse/diamond \u2014 the most fundamental excalidraw interaction. If this breaks, the product is dead.",
+      "category": "core-creation",
+      "test_path": "packages/excalidraw/tests/dragCreate.test.tsx",
+      "owning_code_paths": [
+        "packages/excalidraw/components/App.tsx",
+        "packages/element/src/newElement.ts",
+        "packages/excalidraw/scene/Renderer.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "draw-multi-point-shape",
+      "description": "User creates linear element (line, arrow, freedraw) by clicking multiple points",
+      "category": "core-creation",
+      "test_path": "packages/excalidraw/tests/multiPointCreate.test.tsx",
+      "owning_code_paths": [
+        "packages/excalidraw/components/App.tsx",
+        "packages/element/src/linearElementEditor.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "select-and-move-shape",
+      "description": "User clicks an element, drags to move it. Selection state + position state both involved.",
+      "category": "core-interaction",
+      "test_path": "packages/excalidraw/tests/move.test.tsx",
+      "owning_code_paths": [
+        "packages/excalidraw/components/App.tsx",
+        "packages/element/src/selection.ts",
+        "packages/element/src/mutateElement.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "multi-select-via-drag",
+      "description": "User drags an empty area to box-select multiple elements (overlap selection)",
+      "category": "core-interaction",
+      "test_path": "packages/excalidraw/tests/selection.test.tsx",
+      "owning_code_paths": [
+        "packages/element/src/selection.ts",
+        "packages/element/src/collision.ts",
+        "packages/element/src/bounds.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "resize-shape",
+      "description": "User drags a resize handle to scale an element",
+      "category": "core-interaction",
+      "test_path": "packages/element/tests/resize.test.tsx",
+      "owning_code_paths": [
+        "packages/element/src/resizeElements.ts",
+        "packages/element/src/transformHandles.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "undo-redo",
+      "description": "Ctrl-Z reverts, Ctrl-Y re-applies. History state machine.",
+      "category": "core-interaction",
+      "test_path": "packages/excalidraw/tests/history.test.tsx",
+      "owning_code_paths": [
+        "packages/excalidraw/history.ts",
+        "packages/excalidraw/actions/actionHistory.tsx"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "restore-from-data",
+      "description": "Load a saved drawing \u2014 restores element list + app state from serialized form. Failure mode: invalid data crashes the editor.",
+      "category": "persistence",
+      "test_path": "packages/excalidraw/tests/data/restore.test.ts",
+      "owning_code_paths": [
+        "packages/excalidraw/data/restore.ts",
+        "packages/math/src/point.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    },
+    {
+      "name": "export-to-image",
+      "description": "Export drawing as PNG/SVG. End-to-end render pipeline.",
+      "category": "output",
+      "test_path": "packages/excalidraw/tests/export.test.tsx",
+      "owning_code_paths": [
+        "packages/excalidraw/scene/export.ts",
+        "packages/utils/src/export.ts"
+      ],
+      "last_verified": null,
+      "verified_at_runs": []
+    }
+  ],
+  "flow_code_mappings": [],
+  "known_blind_spots": [
+    {
+      "description": "Excalidraw is a canvas-based SPA with no traditional routes. Layer 3 (route smoke) does not apply. Critical Path Sentinel covers this gap by running the critical_flows tests.",
+      "observed_at": "2026-05-28T10:50:00Z"
+    },
+    {
+      "description": "Vitest coverage --reporter=json output structure may include relative paths. coverage-diff.ts must normalize paths against project_root before matching against diff file paths.",
+      "observed_at": "2026-05-28T10:50:00Z"
+    },
+    {
+      "description": "Type-only files (.d.ts, types.ts) appear as 'uncovered' in Vitest coverage because they have no runtime statements. This produces FALSE POSITIVES in blast-radius analysis. Discovered during POC run on commit 2dfcc6f0 \u2014 types.ts marked uncovered (17 lines) but all critical flows passed. Sentinel correctly overrode. Future fix: detect type-only files and classify as 'no_runtime_code' (separate from 'uncovered').",
+      "observed_at": "2026-05-28T13:00:00Z",
+      "discovered_in_run": "20260528T055701Z__2dfcc6f0"
+    },
+    {
+      "description": "Snapshot test files (.test.tsx.snap) are correctly excluded as test_file_excluded by the TEST_FILE_REGEX in coverage-diff.ts, BUT they appear as part of the diff. They're auto-generated artifacts \u2014 changes to them shouldn't trigger any human review concern. Currently we list them in the per-file table which adds noise. Future fix: also exclude .snap files from the visible report or aggregate them under a separate 'snapshot updates' line.",
+      "observed_at": "2026-05-28T13:00:00Z",
+      "discovered_in_run": "20260528T055701Z__2dfcc6f0"
+    },
+    {
+      "description": "Auditor and Sentinel disagreement is currently 'PASS vs WARN' in 3/3 POC runs because Auditor is strict about any uncovered line (incl. type files) while Sentinel verifies actual behavior. This is the methodology working as designed \u2014 but for v1, consider tuning Auditor to be less alarmist for low-impact uncovered lines (e.g. type-only, snapshot-only, comment-only changes).",
+      "observed_at": "2026-05-28T13:00:00Z",
+      "discovered_in_run": "all-three-poc-runs"
+    }
+  ],
+  "run_history": [
+    {
+      "run_id": "20260528T055626Z__0457ac90",
+      "timestamp": "2026-05-28T05:56:30Z",
+      "final_verdict": "WARN",
+      "final_confidence": 0.56,
+      "auditor_verdict": "WARN",
+      "sentinel_verdict": "PASS",
+      "agreement": false,
+      "production_lines_changed": 104,
+      "covered_lines": 98,
+      "flows_tested": 1,
+      "flows_passed": 1
+    },
+    {
+      "run_id": "20260528T055701Z__2dfcc6f0",
+      "timestamp": "2026-05-28T05:57:32Z",
+      "final_verdict": "WARN",
+      "final_confidence": 0.14,
+      "auditor_verdict": "WARN",
+      "sentinel_verdict": "PASS",
+      "agreement": false,
+      "production_lines_changed": 22,
+      "covered_lines": 5,
+      "flows_tested": 8,
+      "flows_passed": 8
+    },
+    {
+      "run_id": "20260528T055732Z__c09e170b",
+      "timestamp": "2026-05-28T05:57:54Z",
+      "final_verdict": "WARN",
+      "final_confidence": 0.53,
+      "auditor_verdict": "WARN",
+      "sentinel_verdict": "PASS",
+      "agreement": false,
+      "flows_tested": 8,
+      "flows_passed": 8
+    }
+  ],
+  "schema_version": "1.0.0",
+  "created_at": "2026-05-28T10:50:00Z",
+  "last_updated": "2026-05-28T11:07:47Z",
+  "team_identity": {
+    "project": "excalidraw",
+    "team_founded_at": "2026-05-28T10:50:00Z",
+    "agents": {
+      "regression-auditor": {
+        "agent_id": "regression-auditor-excalidraw-ee760ba9",
+        "joined_team_at": "2026-05-28T09:39:41Z",
+        "total_invocations": 14,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T093941Z__0457ac90",
+            "verdict": "WARN",
+            "confidence": 0.94,
+            "key_observation": "packages/excalidraw/data/restore.ts: 6 of 94 changed lines uncovered"
+          },
+          {
+            "run_id": "20260528T094013Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T094045Z__c09e170b",
+            "verdict": "WARN",
+            "confidence": 0.89,
+            "key_observation": "packages/excalidraw/actions/actionDeselect.ts: 17 of 145 changed lines uncovered"
+          },
+          {
+            "run_id": "20260528T095045Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T095123Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T095528Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "idea-20260528T100110Z",
+            "verdict": "BRAINSTORM",
+            "confidence": null,
+            "key_observation": "Which existing modules in the project is this idea most likely to touch? Cross-check against blast-radius history \u2014 modules with low coverage become risk hotspots."
+          },
+          {
+            "run_id": "reflect-20260528T100126Z",
+            "verdict": "REFLECTION",
+            "confidence": null,
+            "key_observation": "Recent run verdict distribution: {'WARN': 3}"
+          },
+          {
+            "run_id": "20260528T103849Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T104237Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T104333Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no warnings"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no warnings"
+          }
+        ],
+        "tenure_score": 0.07
+      },
+      "critical-path-sentinel": {
+        "agent_id": "critical-path-sentinel-excalidraw-bcc89b5b",
+        "joined_team_at": "2026-05-28T09:39:42Z",
+        "total_invocations": 17,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T093941Z__0457ac90",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T094013Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T094045Z__c09e170b",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T095045Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T095123Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T095528Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "req-20260528T100115Z",
+            "verdict": "REQUIREMENTS_REVIEW",
+            "confidence": null,
+            "key_observation": "2 testability concern(s) raised"
+          },
+          {
+            "run_id": "reflect-20260528T100126Z",
+            "verdict": "REFLECTION",
+            "confidence": null,
+            "key_observation": "Recent run verdict distribution: {'WARN': 3}"
+          },
+          {
+            "run_id": "20260528T102446Z__0457ac90",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T102544Z__0457ac90",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T103849Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T104237Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T104333Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "8 flows passed, 0 failed, 0 missing"
+          }
+        ],
+        "tenure_score": 0.09
+      },
+      "qa-lead": {
+        "agent_id": "qa-lead-excalidraw-408805b0",
+        "joined_team_at": "2026-05-28T09:40:13Z",
+        "total_invocations": 15,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T093941Z__0457ac90",
+            "verdict": "WARN",
+            "confidence": 0.56,
+            "key_observation": "disagreement: Auditor said WARN, Sentinel said PASS. Reconcile manually."
+          },
+          {
+            "run_id": "20260528T094013Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T094045Z__c09e170b",
+            "verdict": "WARN",
+            "confidence": 0.53,
+            "key_observation": "disagreement: Auditor said WARN, Sentinel said PASS. Reconcile manually."
+          },
+          {
+            "run_id": "20260528T095045Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T095123Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T095528Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T102446Z__0457ac90",
+            "verdict": "WARN",
+            "confidence": 0.56,
+            "key_observation": "disagreement: Disagreement across agents: auditor=WARN (94%), sentinel=PASS (95%), contract=PASS (95%)"
+          },
+          {
+            "run_id": "20260528T102544Z__0457ac90",
+            "verdict": "WARN",
+            "confidence": 0.56,
+            "key_observation": "disagreement: Disagreement across agents: auditor=WARN (94%), sentinel=PASS (95%), contract=PASS (95%)"
+          },
+          {
+            "run_id": "20260528T103849Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T104237Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T104333Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "agreement"
+          }
+        ],
+        "tenure_score": 0.07
+      },
+      "contract-sentinel": {
+        "agent_id": "contract-sentinel-excalidraw-9fddd3ff",
+        "joined_team_at": "2026-05-28T09:56:00Z",
+        "total_invocations": 12,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T095528Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "idea-20260528T100110Z",
+            "verdict": "BRAINSTORM",
+            "confidence": null,
+            "key_observation": "Does this idea imply any public API or data schema change? If so, list downstream consumers BEFORE coding."
+          },
+          {
+            "run_id": "design-20260528T100121Z",
+            "verdict": "DESIGN_REVIEW",
+            "confidence": null,
+            "key_observation": "Design mentions breaking change \u2014 list downstream consumers explicitly."
+          },
+          {
+            "run_id": "20260528T102446Z__0457ac90",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T102544Z__0457ac90",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T103849Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T104237Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T104333Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.95,
+            "key_observation": "no typecheck errors"
+          }
+        ],
+        "tenure_score": 0.06
+      },
+      "core-flow-cartographer": {
+        "agent_id": "core-flow-cartographer-excalidraw-d923cdde",
+        "joined_team_at": "2026-05-28T10:01:10Z",
+        "total_invocations": 1,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "idea-20260528T100110Z",
+            "verdict": "BRAINSTORM",
+            "confidence": null,
+            "key_observation": "Does this idea introduce a new user-visible flow? Current critical_flows: ['draw-shape-via-drag', 'draw-multi-point-shape', 'select-and-move-shape', 'multi-select-via-drag', 'resize-shape', 'undo-redo"
+          }
+        ],
+        "tenure_score": 0.01
+      },
+      "performance-watch": {
+        "agent_id": "performance-watch-excalidraw-318a2cb6",
+        "joined_team_at": "2026-05-28T10:43:11Z",
+        "total_invocations": 6,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T104237Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          },
+          {
+            "run_id": "20260528T104333Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          },
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.9,
+            "key_observation": "8 baselines updated, no slowdowns"
+          }
+        ],
+        "tenure_score": 0.03
+      },
+      "security-scout": {
+        "agent_id": "security-scout-excalidraw-1665bde7",
+        "joined_team_at": "2026-05-28T10:48:28Z",
+        "total_invocations": 4,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T104750Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.85,
+            "key_observation": "no security concerns found"
+          },
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.85,
+            "key_observation": "no security concerns found"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.85,
+            "key_observation": "no security concerns found"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.85,
+            "key_observation": "no security concerns found"
+          }
+        ],
+        "tenure_score": 0.02
+      },
+      "a11y-auditor": {
+        "agent_id": "a11y-auditor-excalidraw-f9ba549b",
+        "joined_team_at": "2026-05-28T10:52:32Z",
+        "total_invocations": 3,
+        "specializations_learned": [],
+        "weight_adjustments_learned": {},
+        "recent_findings": [
+          {
+            "run_id": "20260528T105155Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no heuristic a11y issues found"
+          },
+          {
+            "run_id": "20260528T105657Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no heuristic a11y issues found"
+          },
+          {
+            "run_id": "20260528T110707Z__2dfcc6f0",
+            "verdict": "PASS",
+            "confidence": 0.7,
+            "key_observation": "no heuristic a11y issues found"
+          }
+        ],
+        "tenure_score": 0.01
+      }
+    }
+  },
+  "file_importance_weights": {
+    "patterns": [
+      {
+        "glob": "**/*.d.ts",
+        "weight": 0.0,
+        "reason": "type-only, no runtime"
+      },
+      {
+        "glob": "**/*.snap",
+        "weight": 0.0,
+        "reason": "auto-generated snapshot"
+      },
+      {
+        "glob": "**/*.test.{ts,tsx,js,jsx}",
+        "weight": 0.0,
+        "reason": "test code"
+      },
+      {
+        "glob": "**/types.ts",
+        "weight": 0.0,
+        "reason": "type-only file (Excalidraw convention)"
+      },
+      {
+        "glob": "**/*.config.{ts,mts,js,mjs}",
+        "weight": 0.3,
+        "reason": "build config"
+      }
+    ],
+    "default": 1.0
+  },
+  "learned_patterns": [
+    {
+      "pattern": "auditor_warn_with_sentinel_pass_disagreement",
+      "observed_outcomes": [
+        {
+          "verdict_pattern": "Auditor=WARN, Sentinel=PASS",
+          "count": 3,
+          "last_seen": "2026-05-28T10:05:29Z"
+        }
+      ],
+      "auto_adjustment": {
+        "action": "review_file_importance_weights",
+        "reason": "3 of last 3 runs showed Auditor WARN + Sentinel PASS. This suggests Auditor is flagging non-impactful changes. Consider widening file_importance_weights with weight 0.0 for newly-detected non-risk file patterns."
+      },
+      "explanation": "3 consecutive disagreements between Auditor and Sentinel. User should review the per-run reports and either tune weights or accept that this is a real concern.",
+      "added_at": "2026-05-28T10:05:29Z",
+      "added_by_agent": "model-keeper",
+      "added_in_run": "learn-2026-05-28T10:05:29Z",
+      "confidence": 0.7,
+      "human_reviewed": true,
+      "approved_at": "2026-05-28T10:05:41Z"
+    }
+  ],
+  "lifecycle_artifacts": {
+    "ideas_under_consideration": [
+      {
+        "entry_id": "idea-20260528T100110Z",
+        "idea": "Add multi-cursor collaboration for shared whiteboards",
+        "team_questions": {
+          "cartographer": "Does this idea introduce a new user-visible flow? Current critical_flows: ['draw-shape-via-drag', 'draw-multi-point-shape', 'select-and-move-shape', 'multi-select-via-drag', 'resize-shape', 'undo-redo', 'restore-from-data', 'export-to-image']. Suggested action: name a new flow and propose its test_path.",
+          "auditor": "Which existing modules in the project is this idea most likely to touch? Cross-check against blast-radius history \u2014 modules with low coverage become risk hotspots.",
+          "contract_sentinel": "Does this idea imply any public API or data schema change? If so, list downstream consumers BEFORE coding."
+        },
+        "status": "open",
+        "added_at": "2026-05-28T10:01:10Z",
+        "added_by_agent": "qa-lead",
+        "added_in_run": "idea-20260528T100110Z",
+        "confidence": null,
+        "human_reviewed": false
+      },
+      {
+        "entry_id": "req-20260528T100115Z",
+        "source": null,
+        "requirements_excerpt": "User clicks Save and sees confirmation. After login, dashboard loads.",
+        "testability_gaps": [
+          {
+            "category": "interaction",
+            "concern": "Requirement implies user interaction. Needs a Playwright/RTL fixture. Check critical_flows for an existing fit; if none, propose a new flow."
+          },
+          {
+            "category": "auth",
+            "concern": "Auth-aware test fixture needed. Verify Model Keeper has auth setup in critical_flows."
+          }
+        ],
+        "status": "open",
+        "added_at": "2026-05-28T10:01:15Z",
+        "added_by_agent": "critical-path-sentinel",
+        "added_in_run": "req-20260528T100115Z",
+        "confidence": null,
+        "human_reviewed": false
+      }
+    ],
+    "design_reviews_completed": [
+      {
+        "entry_id": "design-20260528T100121Z",
+        "source": null,
+        "design_excerpt": "Breaking change: rename schema field metadata.legacy to metadata.extra. Downstream API endpoint /v2/items will need migration.",
+        "findings": [
+          "Design mentions breaking change \u2014 list downstream consumers explicitly.",
+          "Schema change \u2014 check Model Keeper's contract history for similar past changes."
+        ],
+        "status": "completed",
+        "added_at": "2026-05-28T10:01:21Z",
+        "added_by_agent": "contract-sentinel",
+        "added_in_run": "design-20260528T100121Z",
+        "confidence": null,
+        "human_reviewed": false
+      }
+    ],
+    "post_merge_reflections": [
+      {
+        "entry_id": "reflect-20260528T100126Z",
+        "insights": [
+          "Recent run verdict distribution: {'WARN': 3}"
+        ],
+        "runs_analyzed": 3,
+        "added_at": "2026-05-28T10:01:26Z",
+        "added_by_agent": "qa-lead",
+        "added_in_run": "reflect-20260528T100126Z",
+        "confidence": null,
+        "human_reviewed": false
+      }
+    ],
+    "synthesis_proposals": [
+      {
+        "proposal_id": "synth-restore.ts-2026-05-28T10:24:47Z",
+        "uncovered_file": "packages/excalidraw/data/restore.ts",
+        "uncovered_lines": [
+          134,
+          135,
+          136,
+          137,
+          138,
+          142
+        ],
+        "uncovered_line_count": 6,
+        "playwright_stub": "// auto-generated stub by EGV Layer 2 (v1) \u2014 NEEDS HUMAN COMPLETION\n// File under test: packages/excalidraw/data/restore.ts\n// Uncovered lines: [134, 135, 136, 137, 138, 142]\n// Suggested behavior to verify: <FILL IN \u2014 describe the user-visible behavior these lines support>\n\nimport { test, expect } from '@playwright/test';\n\ntest.describe('restore.ts \u2014 uncovered behavior coverage', () => {\n  test('exercises uncovered lines 134-142', async ({ page }) => {\n    // TODO: navigate to the page that triggers this code path\n    await page.goto('/');\n\n    // TODO: perform the user action that exercises lines 134-142\n    // ...\n\n    // TODO: assert the visible outcome\n    // await expect(page.getByRole(...)).toBeVisible();\n  });\n});\n",
+        "needs_human_review": true,
+        "v2_action_when_implemented": "Replace stub with LLM-generated test driven by Playwright MCP. Run 3x consecutively; if green and stable, propose adding to test suite.",
+        "added_at": "2026-05-28T10:24:47Z",
+        "added_by_agent": "layer2-synth",
+        "added_in_run": "2026-05-28T10:24:47.095Z",
+        "confidence": null,
+        "human_reviewed": false
+      },
+      {
+        "proposal_id": "synth-restore.ts-2026-05-28T10:25:46Z",
+        "uncovered_file": "packages/excalidraw/data/restore.ts",
+        "uncovered_lines": [
+          134,
+          135,
+          136,
+          137,
+          138,
+          142
+        ],
+        "uncovered_line_count": 6,
+        "playwright_stub": "// auto-generated stub by EGV Layer 2 (v1) \u2014 NEEDS HUMAN COMPLETION\n// File under test: packages/excalidraw/data/restore.ts\n// Uncovered lines: [134, 135, 136, 137, 138, 142]\n// Suggested behavior to verify: <FILL IN \u2014 describe the user-visible behavior these lines support>\n\nimport { test, expect } from '@playwright/test';\n\ntest.describe('restore.ts \u2014 uncovered behavior coverage', () => {\n  test('exercises uncovered lines 134-142', async ({ page }) => {\n    // TODO: navigate to the page that triggers this code path\n    await page.goto('/');\n\n    // TODO: perform the user action that exercises lines 134-142\n    // ...\n\n    // TODO: assert the visible outcome\n    // await expect(page.getByRole(...)).toBeVisible();\n  });\n});\n",
+        "needs_human_review": true,
+        "v2_action_when_implemented": "Replace stub with LLM-generated test driven by Playwright MCP. Run 3x consecutively; if green and stable, propose adding to test suite.",
+        "added_at": "2026-05-28T10:25:46Z",
+        "added_by_agent": "layer2-synth",
+        "added_in_run": "2026-05-28T10:25:46.102Z",
+        "confidence": null,
+        "human_reviewed": false
+      },
+      {
+        "proposal_id": "synth-types.ts-2026-05-28T10:56:58Z",
+        "uncovered_file": "packages/excalidraw/types.ts",
+        "uncovered_lines": [
+          318,
+          319,
+          320,
+          321,
+          353,
+          354,
+          357,
+          481,
+          482,
+          483,
+          499,
+          879,
+          880,
+          881,
+          884,
+          885,
+          911
+        ],
+        "uncovered_line_count": 17,
+        "playwright_stub": "// auto-generated stub by EGV Layer 2 (v1) \u2014 NEEDS HUMAN COMPLETION\n// File under test: packages/excalidraw/types.ts\n// Uncovered lines: [318, 319, 320, 321, 353, 354, 357, 481, 482, 483, 499, 879, 880, 881, 884, 885, 911]\n// Suggested behavior to verify: <FILL IN \u2014 describe the user-visible behavior these lines support>\n\nimport { test, expect } from '@playwright/test';\n\ntest.describe('types.ts \u2014 uncovered behavior coverage', () => {\n  test('exercises uncovered lines 318-911', async ({ page }) => {\n    // TODO: navigate to the page that triggers this code path\n    await page.goto('/');\n\n    // TODO: perform the user action that exercises lines 318-911\n    // ...\n\n    // TODO: assert the visible outcome\n    // await expect(page.getByRole(...)).toBeVisible();\n  });\n});\n",
+        "synthesis_method": "stub-template",
+        "needs_human_review": true,
+        "v2_action_when_implemented": "Replace stub with LLM-generated test driven by Playwright MCP. Run 3x consecutively; if green and stable, propose adding to test suite.",
+        "added_at": "2026-05-28T10:56:58Z",
+        "added_by_agent": "layer2-synth",
+        "added_in_run": "2026-05-28T10:56:58.148Z",
+        "confidence": null,
+        "human_reviewed": false
+      }
+    ]
+  },
+  "flow_baselines": {
+    "draw-shape-via-drag": {
+      "p50_ms": 3790,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "draw-multi-point-shape": {
+      "p50_ms": 3104,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "select-and-move-shape": {
+      "p50_ms": 3072,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "multi-select-via-drag": {
+      "p50_ms": 4045,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "resize-shape": {
+      "p50_ms": 6039,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "undo-redo": {
+      "p50_ms": 6737,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "restore-from-data": {
+      "p50_ms": 2819,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    },
+    "export-to-image": {
+      "p50_ms": 3060,
+      "n_observations": 6,
+      "last_updated": "2026-05-28T11:07:42Z"
+    }
+  }
+}
