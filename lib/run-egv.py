@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent_identity import read_agent_identity, write_agent_identity
+from llm import LLMAgent, HAIKU, SONNET
 from model_keeper import (
     CURRENT_SCHEMA_VERSION,
     keeper_path_for_project_root,
@@ -211,6 +212,46 @@ def run_regression_auditor(
         "key_observation": (warnings[0] if warnings else "no warnings"),
     })
     write_agent_identity(model_keeper, "regression-auditor", agent_record)
+
+    # LLM reasoning layer (v3) — turn deterministic data into agent judgment
+    auditor_llm = LLMAgent(
+        role_name="Regression Auditor",
+        role_prompt=(
+            "You are the Regression Auditor for this project's EGV team. "
+            "Your job: judge whether code changes are safe based on coverage × diff data. "
+            "You speak in concrete terms about specific files and modules. "
+            "You DO NOT claim safety you cannot prove — you measure blast radius first."
+        ),
+        model=SONNET,
+    )
+    det_data = {
+        "verdict": verdict,
+        "confidence": confidence,
+        "summary_line": f"{summary['production_changed_lines']} production lines changed, {summary['covered_changed_lines']} covered ({coverage_ratio:.0%})",
+        "blast_radius": report["blast_radius"],
+        "warnings": warnings,
+    }
+    llm_judgment = auditor_llm.think(det_data, agent_record)
+    if llm_judgment.used_llm:
+        # Layer LLM reasoning on top — but never lower a FAIL to PASS based on LLM
+        if llm_judgment.verdict in ("PASS", "WARN", "FAIL"):
+            llm_rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
+            det_rank = llm_rank.get(verdict, 1)
+            new_rank = llm_rank.get(llm_judgment.verdict, det_rank)
+            # Take the higher concern level — agent can ESCALATE deterministic but not de-escalate
+            if new_rank > det_rank:
+                report["verdict"] = llm_judgment.verdict
+                report["confidence"] = round(min(confidence, 0.85), 2)
+        report["llm_narrative"] = llm_judgment.narrative
+        report["llm_recommendations"] = llm_judgment.recommendations
+        report["llm_confidence_basis"] = llm_judgment.confidence_basis
+    else:
+        report["llm_narrative"] = llm_judgment.narrative  # fallback message
+
+    # Re-write file with LLM additions
+    auditor_path.write_text(json.dumps(report, indent=2))
+    if llm_judgment.used_llm:
+        print(f"[auditor-llm] {llm_judgment.narrative[:120]}", file=sys.stderr)
 
     return report
 
@@ -658,6 +699,38 @@ def run_security_scout(
     })
     write_agent_identity(model_keeper, "security-scout", agent_record)
 
+    # LLM beyond-regex (v3) — catch things regex missed
+    sec_llm = LLMAgent(
+        role_name="Security Scout",
+        role_prompt=(
+            "You are the Security Scout. Regex caught what regex catches. Your job is to look at "
+            "the diff additions for things regex CAN'T catch: subtle injection patterns, unsafe "
+            "deserialization, JWT misuse, weak crypto choices, broken authz flows. "
+            "If regex already found CRITICAL secrets, agree with FAIL. Otherwise, scan the additions "
+            "for nuanced concerns regex missed. Be specific — quote the line."
+        ),
+        model=HAIKU,
+    )
+    det_data = {
+        "verdict": verdict,
+        "summary_line": (f"regex found: {len(secrets_found)} secrets, "
+                        f"{len(dangerous_found)} dangerous patterns, "
+                        f"{len(dep_files_changed)} dep file changes"),
+        "secrets_found": secrets_found,
+        "dangerous_found": dangerous_found,
+        "diff_additions_sample": "\n".join([line for line in diff_text.split("\n") if line.startswith("+") and not line.startswith("+++")][:50]),
+    }
+    sec_judgment = sec_llm.think(det_data, agent_record)
+    if sec_judgment.used_llm:
+        # Security can only ESCALATE, never de-escalate
+        rank = {"PASS": 0, "WARN": 1, "FAIL": 2}
+        if rank.get(sec_judgment.verdict, 0) > rank.get(verdict, 0):
+            report["verdict"] = sec_judgment.verdict
+            report["confidence"] = min(report["confidence"], 0.85)
+        report["llm_narrative"] = sec_judgment.narrative
+        report["llm_recommendations"] = sec_judgment.recommendations
+    sec_path.write_text(json.dumps(report, indent=2))
+
     return report
 
 
@@ -818,6 +891,34 @@ def synthesize_verdict(
         result["security"] = security_signal
     if a11y_signal:
         result["a11y"] = a11y_signal
+
+    # LLM reasoning layer for QA Lead (v3)
+    qa_llm = LLMAgent(
+        role_name="QA Lead",
+        role_prompt=(
+            "You are the QA Lead synthesizing 6 specialist agents' findings into one verdict. "
+            "When agents agree, validate the verdict with a brief summary. "
+            "When agents disagree, IDENTIFY which disagreement is the most signal-rich "
+            "and explain WHY they might disagree — is it a false positive, a real surfaced issue, "
+            "or a complementary view? Be concise and actionable."
+        ),
+        model=SONNET,
+    )
+    qa_record = read_agent_identity(model_keeper, "qa-lead")
+    det_data = {
+        "verdict": final_v,
+        "confidence": final_confidence,
+        "agreement": full_agreement,
+        "summary_line": f"final={final_v} @ {int(final_confidence*100)}%, agreement={full_agreement}",
+        "all_verdicts": verdicts,
+        "all_confidences": confidences,
+        "disagreement_detail": disagreement_reason,
+    }
+    qa_judgment = qa_llm.think(det_data, qa_record)
+    if qa_judgment.used_llm:
+        result["llm_synthesis"] = qa_judgment.narrative
+        result["llm_recommendations"] = qa_judgment.recommendations
+
     return result
 
 

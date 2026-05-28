@@ -32,46 +32,107 @@ def _make_entry_id(prefix: str) -> str:
 
 def log_brainstorm(project_root: Path, idea: str) -> dict[str, Any]:
     """Append an idea to ideas_under_consideration. Three team members 'speak':
-    Cartographer, Auditor, Contract Sentinel.
+    Cartographer, Auditor, Contract Sentinel. v3: questions are LLM-generated
+    when ANTHROPIC_API_KEY is set; otherwise falls back to templates.
     """
+    from llm import LLMAgent, HAIKU, SONNET, llm_available
+
     keeper_path = keeper_path_for_project_root(project_root)
     keeper = load_model_keeper(keeper_path)
     entry_id = _make_entry_id("idea")
 
-    # Cartographer: does this become a new critical_flow?
+    existing_flows = [f["name"] for f in keeper.get("critical_flows", [])]
+    blind_spots_summary = "; ".join(
+        bs.get("description", "")[:100] for bs in keeper.get("known_blind_spots", [])[:5]
+    )
+
+    # Build base prompt context for all three agents
+    context_summary = f"""
+Current project state:
+- Project: {keeper.get('project_name', 'unknown')}
+- Critical flows ({len(existing_flows)}): {', '.join(existing_flows[:8])}
+- Known blind spots: {blind_spots_summary or '(none yet)'}
+- Total verification runs so far: {len(keeper.get('run_history', []))}
+"""
+
+    # Cartographer
     cartographer_rec = read_agent_identity(keeper, "core-flow-cartographer")
     cartographer_rec["total_invocations"] += 1
-    cartographer_question = (
-        "Does this idea introduce a new user-visible flow? "
-        f"Current critical_flows: {[f['name'] for f in keeper.get('critical_flows', [])]}. "
-        "Suggested action: name a new flow and propose its test_path."
-    )
+    if llm_available():
+        cart_agent = LLMAgent(
+            role_name="Core Flow Cartographer",
+            role_prompt="You are the Core Flow Cartographer. You maintain the list of user-visible behaviors that MUST work. You ask specific, pointed questions about whether a new idea introduces new critical user flows. Be concrete — name flows.",
+            model=HAIKU,
+        )
+        result = cart_agent.think(
+            deterministic_data={"verdict": "BRAINSTORM", "idea": idea, "summary_line": context_summary},
+            identity_record=cartographer_rec,
+        )
+        cartographer_question = result.narrative if result.used_llm else (
+            f"Does this idea introduce a new user-visible flow? Current critical_flows: {existing_flows}. Suggested action: name a new flow and propose its test_path."
+        )
+    else:
+        cartographer_question = (
+            f"Does this idea introduce a new user-visible flow? "
+            f"Current critical_flows: {existing_flows}. "
+            "Suggested action: name a new flow and propose its test_path."
+        )
     cartographer_rec["recent_findings"].append({
         "run_id": entry_id, "verdict": "BRAINSTORM",
         "confidence": None, "key_observation": cartographer_question[:200],
     })
     write_agent_identity(keeper, "core-flow-cartographer", cartographer_rec)
 
-    # Auditor: which modules will likely be touched?
+    # Auditor
     auditor_rec = read_agent_identity(keeper, "regression-auditor")
     auditor_rec["total_invocations"] += 1
-    auditor_question = (
-        "Which existing modules in the project is this idea most likely to touch? "
-        "Cross-check against blast-radius history — modules with low coverage become risk hotspots."
-    )
+    if llm_available():
+        aud_agent = LLMAgent(
+            role_name="Regression Auditor",
+            role_prompt="You are the Regression Auditor. You think in terms of blast radius and historical risk hotspots. Given an idea, you predict WHICH modules it will touch and which of those have low coverage. Be specific — reference real file patterns.",
+            model=HAIKU,
+        )
+        result = aud_agent.think(
+            deterministic_data={"verdict": "BRAINSTORM", "idea": idea, "summary_line": context_summary},
+            identity_record=auditor_rec,
+        )
+        auditor_question = result.narrative if result.used_llm else (
+            "Which existing modules in the project is this idea most likely to touch? "
+            "Cross-check against blast-radius history — modules with low coverage become risk hotspots."
+        )
+    else:
+        auditor_question = (
+            "Which existing modules in the project is this idea most likely to touch? "
+            "Cross-check against blast-radius history — modules with low coverage become risk hotspots."
+        )
     auditor_rec["recent_findings"].append({
         "run_id": entry_id, "verdict": "BRAINSTORM",
         "confidence": None, "key_observation": auditor_question[:200],
     })
     write_agent_identity(keeper, "regression-auditor", auditor_rec)
 
-    # Contract Sentinel: any API/schema changes implied?
+    # Contract Sentinel
     contract_rec = read_agent_identity(keeper, "contract-sentinel")
     contract_rec["total_invocations"] += 1
-    contract_question = (
-        "Does this idea imply any public API or data schema change? "
-        "If so, list downstream consumers BEFORE coding."
-    )
+    if llm_available():
+        contract_agent = LLMAgent(
+            role_name="Contract Sentinel",
+            role_prompt="You are the Contract Sentinel. You think about public API surface, schema breakage, and downstream consumers. Given an idea, you anticipate which contracts might break and who depends on them.",
+            model=HAIKU,
+        )
+        result = contract_agent.think(
+            deterministic_data={"verdict": "BRAINSTORM", "idea": idea, "summary_line": context_summary},
+            identity_record=contract_rec,
+        )
+        contract_question = result.narrative if result.used_llm else (
+            "Does this idea imply any public API or data schema change? "
+            "If so, list downstream consumers BEFORE coding."
+        )
+    else:
+        contract_question = (
+            "Does this idea imply any public API or data schema change? "
+            "If so, list downstream consumers BEFORE coding."
+        )
     contract_rec["recent_findings"].append({
         "run_id": entry_id, "verdict": "BRAINSTORM",
         "confidence": None, "key_observation": contract_question[:200],
@@ -86,6 +147,7 @@ def log_brainstorm(project_root: Path, idea: str) -> dict[str, Any]:
             "auditor": auditor_question,
             "contract_sentinel": contract_question,
         },
+        "llm_powered": llm_available(),
         "status": "open",
         **provenance_stamp(agent="qa-lead", run_id=entry_id),
     }
