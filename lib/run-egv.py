@@ -18,11 +18,12 @@ Every verification run is a three-phase team meeting:
     The QA Lead (also LLM) reads both phases and produces the final verdict
     with narrative explaining how the team converged (or didn't).
 
-LLM is MANDATORY. Missing ANTHROPIC_API_KEY = clear FATAL error, exit 2.
-No SDK required (raw urllib HTTPS to Anthropic API).
+LLM is MANDATORY. Missing `claude` CLI = clear FATAL error, exit 2.
+Uses `claude -p` (non-interactive) which reads existing Claude Code auth.
+No SDK or separate API key required.
 
 Usage:
-  ANTHROPIC_API_KEY=sk-ant-... python3 run-egv.py <commit-sha-or-diff-path> \\
+  python3 run-egv.py <commit-sha-or-diff-path> \\
       --project-root /path/to/project [--selected-flows name1,name2]
 
 Output: reports/<run_id>/{verdict.md, verdict.json, <agent>.json, <agent>-review.json}
@@ -50,7 +51,7 @@ from llm import (
     LLMAgent,
     LLMResult,
     LLMUnavailableError,
-    require_api_key,
+    require_claude_cli,
 )
 from model_keeper import (
     keeper_path_for_project_root,
@@ -1221,6 +1222,7 @@ def synthesize_verdict_v3(
         "qa_lead_synthesis": qa_result.narrative,
         "qa_lead_recommendations": qa_result.recommendations,
         "qa_lead_confidence_basis": qa_result.confidence_basis,
+        "qa_lead_cost_usd": qa_result.cost_usd,
         "agreement": full_agreement,
         "phase1_verdicts": {
             role: phase1[role]["phase1"].verdict for role in phase1
@@ -1308,9 +1310,9 @@ def main() -> None:
     parser.add_argument("--enable-layer2", action="store_true")
     args = parser.parse_args()
 
-    # Verify API key BEFORE doing any work
+    # Verify `claude` CLI is available BEFORE doing any work
     try:
-        require_api_key()
+        require_claude_cli()
     except LLMUnavailableError as exc:
         print(f"FATAL: {exc}", file=sys.stderr)
         sys.exit(2)
@@ -1440,6 +1442,22 @@ def main() -> None:
     # ------------- Phase 3 -------------
     print("[team] === PHASE 3: QA Lead synthesis ===", file=sys.stderr)
     verdict = synthesize_verdict_v3(phase1, phase2, run_dir, model_keeper)
+
+    # Sum cost across all LLM calls (6 phase-1 + 6 phase-2 + 1 QA Lead)
+    total_cost = 0.0
+    for role_key, p1_data in phase1.items():
+        p1 = p1_data.get("phase1")
+        if p1 is not None and hasattr(p1, "cost_usd"):
+            total_cost += p1.cost_usd
+    for role_key, p2_data in phase2.items():
+        p2 = p2_data.get("phase2")
+        if p2 is not None and hasattr(p2, "cost_usd"):
+            total_cost += p2.cost_usd
+    total_cost += float(verdict.get("qa_lead_cost_usd", 0.0))
+    verdict["total_cost_usd"] = round(total_cost, 4)
+    # Persist the updated verdict.json with cost field
+    (run_dir / "verdict.json").write_text(json.dumps(verdict, indent=2))
+
     write_verdict_md_v3(verdict, phase1, phase2, run_dir, args.target)
 
     save_model_keeper(keeper_path, model_keeper)
@@ -1459,6 +1477,7 @@ def main() -> None:
     for role, v in verdict["phase2_verdicts"].items():
         print(f"  {role}: {v}")
     print(f"\nQA Lead synthesis: {verdict['qa_lead_synthesis'][:300]}")
+    print(f"\nTotal cost this run: ${total_cost:.4f}")
     print(f"\nReport: {run_dir / 'verdict.md'}")
 
 

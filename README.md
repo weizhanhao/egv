@@ -18,7 +18,7 @@ EGV addresses both with: (1) tooling that forces evidence-backed verification, a
 
 ## Why this is a REAL agent team (not deterministic theater)
 
-EGV v3 makes a hard commitment: every verification run is a Claude LLM team meeting. There is no deterministic-only fallback. `ANTHROPIC_API_KEY` is mandatory. Why:
+EGV v3 makes a hard commitment: every verification run is a Claude LLM team meeting. There is no deterministic-only fallback. The `claude` CLI (from Claude Code) is mandatory. Why:
 
 - Deterministic verification tools (`jest --findRelatedTests`, `nx affected`, security regex) tell you WHICH files moved. They don't tell you WHAT IT MEANS.
 - A team that's been on your project for 6 months tells you what it means. They reference past incidents. They argue with each other. They escalate based on combined signals.
@@ -29,7 +29,7 @@ EGV agents are LLM-backed for the interpretation layer. The sensors (coverage pa
 2. **Phase 2 (team review)** — each agent sees ALL six phase-1 findings and decides whether to stand by, escalate, de-escalate, or raise a cross-cutting concern.
 3. **Phase 3 (QA Lead synthesis)** — a 7th LLM call reads both phases and produces the final verdict narrative.
 
-No SDK install required — EGV uses raw HTTPS to the Anthropic API. Works even when `pip install anthropic` is blocked by PEP 668.
+No SDK install required and no separate API key — EGV shells out to `claude -p` (non-interactive print mode), which uses the existing Claude Code authentication on the box (subscription or API key, whichever you've already configured). Works even when `pip install anthropic` is blocked by PEP 668.
 
 ## Quick install
 
@@ -115,17 +115,17 @@ python3 ~/.claude/skills/egv-verify/lib/egv_cli.py learn \
 
 ## Prerequisites
 
-- **`ANTHROPIC_API_KEY`** (mandatory — every run is a real LLM team meeting)
+- **Claude Code installed** so the `claude` CLI is on PATH (mandatory — every run is a real LLM team meeting). Verify with `claude --version`.
 - Python 3.10+
 - Test framework that emits Istanbul-format coverage JSON (Vitest, Jest, etc.)
 - `tsc` for Contract Sentinel (optional)
 - `tsx` for the TypeScript blast-radius computer (auto via `npx`)
 
-No SDK install required (raw HTTPS to the Anthropic API).
+No separate API key required and no Python SDK install — EGV invokes `claude -p` and uses your existing Claude Code authentication (subscription or API key, whichever you've already configured).
 
 ### Cost per run
 
-~13 Claude API calls per verification (6 phase-1 + 6 phase-2 + 1 QA Lead synthesis). With Haiku for most agents and Sonnet for the two thinking roles (Auditor + QA Lead), expect **~$0.05-0.20 per run**.
+~13 Claude calls per verification (6 phase-1 + 6 phase-2 + 1 QA Lead synthesis). With Haiku for most agents and Sonnet for the two thinking roles (Auditor + QA Lead), expect **~$0.05-0.20 per run**. The exact cost is summed and printed in the run summary. On a Claude Pro/Max subscription this comes out of your usage allowance with no separate billing.
 
 ## Multi-user — team brain via git
 

@@ -33,7 +33,7 @@ def _make_entry_id(prefix: str) -> str:
 def log_brainstorm(project_root: Path, idea: str) -> dict[str, Any]:
     """Append an idea to ideas_under_consideration. Three team members 'speak':
     Cartographer, Auditor, Contract Sentinel. v3: questions are LLM-generated
-    when ANTHROPIC_API_KEY is set; otherwise falls back to templates.
+    when the `claude` CLI is available; otherwise falls back to templates.
     """
     from llm import LLMAgent, HAIKU, SONNET, llm_available
 

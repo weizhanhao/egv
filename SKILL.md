@@ -84,8 +84,8 @@ A persistent, named AI test team that lives with each project from day one. The 
 ### Verify a diff
 
 ```bash
-# REQUIRED: real LLM team — set your Anthropic API key
-export ANTHROPIC_API_KEY=sk-ant-...
+# EGV uses the `claude` CLI directly — no separate API key needed.
+# Make sure you've got Claude Code installed and `claude --version` works.
 
 # Verify a commit SHA or staged diff
 python3 ~/.claude/skills/egv-verify/lib/run-egv.py <commit-sha-or-HEAD> --project-root /path/to/project
@@ -130,19 +130,23 @@ python3 ~/.claude/skills/egv-verify/lib/egv_cli.py layer2-review \
 
 ## Prerequisites
 
-EGV v3 is a REAL LLM agent team — every run, all 8 agents use Claude to reason about your code. This is mandatory, not optional:
+EGV v3 is a REAL LLM agent team — every run, all 8 agents use Claude to reason about your code. This is mandatory.
 
-- **`ANTHROPIC_API_KEY`** environment variable (get one at https://console.anthropic.com/)
+- **Claude Code installed** (provides the `claude` CLI). If you can run `claude --version`, you're set.
 - Python 3.10+
-- A test framework that emits Istanbul-format coverage JSON (Vitest, Jest, etc.)
+- Test framework that emits Istanbul-format coverage JSON (Vitest, Jest, etc.)
 - `tsc` for Contract Sentinel (optional — skip if not TypeScript)
 - `tsx` (for running the TypeScript blast-radius computer) — auto-installed via npx
 
-NO Python SDK install required — EGV uses raw HTTPS to the Anthropic API, so it works even when `pip install anthropic` is blocked by PEP 668.
+**No separate API key required** — EGV calls `claude -p` (non-interactive print mode), which uses your existing Claude Code authentication (subscription or API key, whatever you've already configured for Claude Code).
+
+**No Python SDK install required** — EGV uses subprocess, bypasses PEP 668.
 
 ## Cost
 
-Each verification run makes ~13 Claude API calls (6 phase-1 + 6 phase-2 + 1 QA Lead synthesis). With Haiku for most agents and Sonnet for the two "thinking" roles (Auditor + QA Lead), expect **~$0.05-0.20 per run**.
+Each verification run makes ~13 Claude calls (6 phase-1 + 6 phase-2 + 1 QA Lead). Cost is tracked per run and printed in the summary. Typical run: **~$0.05-0.20** with Haiku for most agents and Sonnet for the two "thinking" roles (Auditor + QA Lead).
+
+If you're on a Claude Pro/Max subscription, this comes out of your usage allowance — no extra billing.
 
 ## How the team collaborates each run
 

@@ -1,68 +1,79 @@
-"""llm.py — Real LLM agent infrastructure for EGV team (v3).
+"""llm.py — Real LLM agent infrastructure for EGV team (v3.1).
 
-CRITICAL design decisions:
-1. LLM is MANDATORY for verification runs. No graceful fallback. Missing API key = clear error.
-2. No anthropic SDK required — uses raw urllib HTTPS POST to bypass PEP 668.
-3. Each agent is invoked TWICE per run: once independently (phase 1) and once
-   for team review (phase 2). This is the real team collaboration.
-4. Identity persists across runs via Model Keeper; agent has tenure + accumulated
-   memory. NOT a subagent — no ephemeral spawn.
+Uses `claude -p` CLI in non-interactive mode. This means:
+- NO separate API key required — uses Claude Code's existing authentication.
+- NO Python SDK install — uses subprocess.
+- Works as long as the user has `claude` CLI in PATH (which they do if they
+  installed Claude Code).
 
-For lifecycle commands (brainstorm/requirements/design-review/reflection), a thin
-backward-compatible ``LLMAgent.think()`` wrapper is provided that gracefully falls
-back when no API key is configured — those commands are advisory, not verification.
+Architecture:
+- Each agent has persistent identity (Model Keeper).
+- investigate(): phase-1 independent finding (1 claude -p call).
+- team_review(): phase-2 commentary on team findings (1 claude -p call).
+- 13 LLM calls per EGV run total (6 specialists x 2 phases + 1 QA Lead).
+
+A thin backward-compatible ``LLMAgent.think()`` wrapper is provided for
+lifecycle commands (brainstorm/requirements/design-review/reflection); those
+commands are advisory and gracefully fall back when the CLI is unavailable.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
+import shutil
+import subprocess
 import sys
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
 
-HAIKU = "claude-haiku-4-5-20251001"
-SONNET = "claude-sonnet-4-6"
-API_URL = "https://api.anthropic.com/v1/messages"
-API_VERSION = "2023-06-01"
+HAIKU = "haiku"
+SONNET = "sonnet"
+DEFAULT_TIMEOUT_S = 120
 
 
 class LLMUnavailableError(Exception):
-    """Raised when ANTHROPIC_API_KEY is missing. EGV v3 verification requires LLM."""
+    """Raised when `claude` CLI is not in PATH."""
 
 
-def require_api_key() -> str:
-    """Return the configured API key or raise LLMUnavailableError."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
+def claude_cli_available() -> bool:
+    """Check if the `claude` CLI binary is on PATH."""
+    return shutil.which("claude") is not None
+
+
+def require_claude_cli() -> str:
+    """Verify `claude` CLI is available. Returns the binary path.
+
+    EGV v3 requires Claude Code. If you have Claude Code installed,
+    `claude` should be in your PATH automatically.
+    """
+    path = shutil.which("claude")
+    if path is None:
         raise LLMUnavailableError(
-            "ANTHROPIC_API_KEY environment variable is required.\n"
+            "The `claude` CLI was not found in PATH.\n"
             "EGV v3 is a real LLM agent team — every agent uses Claude to reason.\n"
-            "Get your key at https://console.anthropic.com/ and export it:\n"
-            "  export ANTHROPIC_API_KEY=sk-ant-..."
+            "Install Claude Code: https://docs.claude.com/claude-code\n"
+            "After install, `claude --version` should work."
         )
-    return key
+    return path
 
 
 def llm_available() -> bool:
     """Lightweight check used by lifecycle commands (brainstorm/etc.)."""
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    return claude_cli_available()
 
 
 @dataclass
 class LLMResult:
-    """Structured response from an LLM agent call."""
-
     verdict: str  # PASS | WARN | FAIL
     narrative: str
     recommendations: list[str]
     confidence_basis: str
     raw_response: str
-    used_llm: bool = True  # phase-1/phase-2 are always True; lifecycle fallback may set False
+    cost_usd: float = 0.0
+    duration_ms: int = 0
+    used_llm: bool = True  # lifecycle fallback may set False
 
 
 def fallback_result(verdict: str, narrative: str = "") -> LLMResult:
@@ -73,46 +84,75 @@ def fallback_result(verdict: str, narrative: str = "") -> LLMResult:
         recommendations=[],
         confidence_basis="deterministic data only; LLM reasoning skipped",
         raw_response="",
+        cost_usd=0.0,
+        duration_ms=0,
         used_llm=False,
     )
 
 
-def _call_claude_raw(
+def _call_claude_cli(
     model: str,
     system_prompt: str,
     user_message: str,
     max_tokens: int = 1500,
-) -> str:
-    """Call Anthropic API via raw HTTPS — no SDK required.
+    timeout_s: int = DEFAULT_TIMEOUT_S,
+) -> tuple[str, float, int]:
+    """Invoke `claude -p` non-interactively. Returns (result_text, cost_usd, duration_ms).
 
-    Raises LLMUnavailableError if API key is missing.
-    Raises urllib.error.HTTPError on API errors.
+    Combines system_prompt + user_message into a single prompt (claude -p doesn't
+    take separate system/user roles — but the model handles a combined prompt well).
     """
-    api_key = require_api_key()
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
-    }
-    req = urllib.request.Request(
-        API_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "X-Api-Key": api_key,
-            "Anthropic-Version": API_VERSION,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    content_blocks = body.get("content", [])
-    text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
-    return "".join(text_parts).strip()
+    require_claude_cli()
+
+    combined = f"{system_prompt}\n\n---\n\n{user_message}"
+
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "json",
+        "--model",
+        model,
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=combined,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LLMUnavailableError(
+            f"`claude -p` timed out after {timeout_s}s"
+        ) from exc
+
+    if proc.returncode != 0:
+        raise LLMUnavailableError(
+            f"`claude -p` exited {proc.returncode}: {proc.stderr[:500]}"
+        )
+
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise LLMUnavailableError(
+            f"`claude -p` returned non-JSON output: {proc.stdout[:300]}"
+        ) from exc
+
+    if envelope.get("is_error"):
+        raise LLMUnavailableError(
+            f"`claude -p` reported error: {envelope.get('result', 'unknown')}"
+        )
+
+    result_text = envelope.get("result", "")
+    cost = float(envelope.get("total_cost_usd", 0.0))
+    duration = int(envelope.get("duration_ms", 0))
+    return result_text, cost, duration
 
 
 def _parse_json_response(raw: str) -> dict:
-    """Parse JSON from response, tolerating markdown fences."""
+    """Parse JSON from response, tolerating markdown fences and prose wrappers."""
     text = raw.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -136,7 +176,7 @@ def _parse_json_response(raw: str) -> dict:
         elif "warn" in text_low:
             v = "WARN"
         else:
-            v = "WARN"  # safe default when parse fails
+            v = "WARN"
         return {
             "verdict": v,
             "narrative": raw[:500],
@@ -148,17 +188,16 @@ def _parse_json_response(raw: str) -> dict:
 class LLMAgent:
     """A REAL LLM-driven agent with persistent project identity.
 
-    Each agent has TWO main methods for verification:
+    Each agent has TWO methods for verification:
     - investigate(): phase-1 independent findings
     - team_review(): phase-2 commentary on the whole team's findings
 
     The legacy ``think()`` method is preserved for lifecycle commands
     (brainstorm/requirements/design-review/reflection) which are advisory and
-    permit graceful fallback when no API key is set.
+    permit graceful fallback when the `claude` CLI is unavailable.
 
-    Identity persists across runs via Model Keeper. The agent's tenure (total
-    invocations, accumulated specializations, recent findings) is passed into
-    every prompt so the LLM reasons WITH that history, not as a fresh subagent.
+    Identity persists across runs via Model Keeper. NOT a subagent — uses
+    `claude -p` subprocess with the user's existing Claude Code auth.
     """
 
     def __init__(
@@ -183,11 +222,10 @@ class LLMAgent:
         identity_record: dict,
         project_context: Optional[str] = None,
     ) -> LLMResult:
-        """Phase 1: investigate independently. Returns structured finding."""
         prompt = self._build_investigate_prompt(
             deterministic_data, identity_record, project_context
         )
-        raw = _call_claude_raw(
+        raw, cost, duration = _call_claude_cli(
             self.model, self.role_prompt, prompt, self.max_tokens
         )
         parsed = _parse_json_response(raw)
@@ -197,16 +235,17 @@ class LLMAgent:
             recommendations=parsed.get("recommendations", []),
             confidence_basis=parsed.get("confidence_basis", ""),
             raw_response=raw,
+            cost_usd=cost,
+            duration_ms=duration,
             used_llm=True,
         )
 
     def team_review(
         self,
         my_phase1: LLMResult,
-        team_findings: dict,  # {agent_role: LLMResult}
+        team_findings: dict,  # {role_name: LLMResult}
         identity_record: dict,
     ) -> LLMResult:
-        """Phase 2: review the team's findings, respond / escalate / agree."""
         prompt = self._build_review_prompt(my_phase1, team_findings, identity_record)
         review_system = (
             self.role_prompt
@@ -217,7 +256,7 @@ class LLMAgent:
             "escalate? Did anyone find a false positive you can help reframe? Speak as "
             "a teammate — reference specific agents by role when relevant."
         )
-        raw = _call_claude_raw(
+        raw, cost, duration = _call_claude_cli(
             self.model, review_system, prompt, self.max_tokens
         )
         parsed = _parse_json_response(raw)
@@ -227,6 +266,8 @@ class LLMAgent:
             recommendations=parsed.get("recommendations", []),
             confidence_basis=parsed.get("confidence_basis", ""),
             raw_response=raw,
+            cost_usd=cost,
+            duration_ms=duration,
             used_llm=True,
         )
 
@@ -240,7 +281,7 @@ class LLMAgent:
         identity_record: dict,
         project_context: Optional[str] = None,
     ) -> LLMResult:
-        """Advisory call — graceful fallback when no API key.
+        """Advisory call — graceful fallback when CLI unavailable.
 
         Used by lifecycle commands (brainstorm/requirements/design-review/
         reflection) which are NOT gated by mandatory LLM. Verification flows
